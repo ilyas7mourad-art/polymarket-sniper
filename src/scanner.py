@@ -68,11 +68,13 @@ def _parse_iso_utc(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def fetch_events_for_series(series_id: int, limit: int = 200) -> list[dict]:
+def fetch_events_for_series(series_id: int, limit: int = 500) -> list[dict]:
     """Fetch non-closed events for a given series_id from the Gamma API.
 
-    Requests are ordered by endDate descending so the freshest markets come
-    first and fill the limit before any stale zombie entries.
+    Returns events unsorted; the caller is expected to filter by time window
+    (see MAX_PAST / MAX_FUTURE). The API includes zombie markets with
+    active=true but endDate months in the past — these are caught by the
+    stale rejection in _try_parse_event_market.
 
     Args:
         series_id: The Polymarket series ID (e.g. 10684 for BTC 5m).
@@ -83,8 +85,7 @@ def fetch_events_for_series(series_id: int, limit: int = 200) -> list[dict]:
     """
     url = (
         f"{config.GAMMA_URL}/events"
-        f"?series_id={series_id}&closed=false"
-        f"&order=endDate&ascending=false&limit={limit}"
+        f"?series_id={series_id}&closed=false&limit={limit}"
     )
     try:
         resp = requests.get(url, timeout=10)

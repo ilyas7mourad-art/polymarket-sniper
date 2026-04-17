@@ -182,3 +182,15 @@ def test_parse_event_market_public_wrapper() -> None:
     result = parse_event_market(event, "BTC", reference_date=REF)
     assert isinstance(result, Market)
     assert result.asset == "BTC"
+
+
+def test_parse_event_market_rejects_december_2025_zombie() -> None:
+    """Regression test: API returns Dec 2025 events with active=true; must be filtered as stale."""
+    ref = datetime(2026, 4, 17, 23, 47, 0, tzinfo=UTC)
+    event = _make_event(
+        event_start="2025-12-19T16:35:00Z",
+        end_date="2025-12-19T16:40:00Z",
+    )
+    market, reason = _try_parse_event_market(event, "BTC", ref)
+    assert market is None
+    assert reason == "stale"
