@@ -38,14 +38,14 @@ REF = datetime(2026, 4, 17, 12, 0, 0, tzinfo=UTC)
 
 
 def test_is_btc_eth_5min_window_accepts_valid() -> None:
-    valid = [
-        "Bitcoin Up or Down - April 17, 3:00PM-3:05PM ET",
-        "Bitcoin Up or Down - January 1, 11:55PM-12:00AM ET",
-        "Ethereum Up or Down - March 3, 9:00AM-9:05AM ET",
-        "Ethereum Up or Down - December 31, 4:45PM-4:50PM ET",
+    cases = [
+        ("Bitcoin Up or Down - April 17, 3:00PM-3:05PM ET", REF),
+        ("Bitcoin Up or Down - January 1, 11:55PM-12:00AM ET", datetime(2026, 1, 1, 4, 0, 0, tzinfo=UTC)),
+        ("Ethereum Up or Down - March 3, 9:00AM-9:05AM ET", datetime(2026, 3, 3, 12, 0, 0, tzinfo=UTC)),
+        ("Ethereum Up or Down - December 31, 4:45PM-4:50PM ET", datetime(2026, 12, 31, 12, 0, 0, tzinfo=UTC)),
     ]
-    for q in valid:
-        assert is_btc_eth_5min_window(q), f"Expected True for: {q}"
+    for q, ref in cases:
+        assert is_btc_eth_5min_window(q, reference_date=ref), f"Expected True for: {q}"
 
 
 def test_is_btc_eth_5min_window_rejects_invalid() -> None:
@@ -118,7 +118,7 @@ def test_parse_window_times_returns_none_on_bad_input() -> None:
 def test_parse_market_returns_none_on_missing_token_ids() -> None:
     raw = {**SAMPLE_MARKET}
     del raw["clobTokenIds"]
-    assert parse_market(raw) is None
+    assert parse_market(raw, reference_date=REF) is None
 
 
 def test_parse_market_returns_none_on_non_5min() -> None:
@@ -126,11 +126,11 @@ def test_parse_market_returns_none_on_non_5min() -> None:
         **SAMPLE_MARKET,
         "question": "Ethereum Up or Down - April 14, 5:15PM-5:30PM ET",
     }
-    assert parse_market(raw) is None
+    assert parse_market(raw, reference_date=REF) is None
 
 
 def test_parse_market_happy_path() -> None:
-    market = parse_market(SAMPLE_MARKET)
+    market = parse_market(SAMPLE_MARKET, reference_date=REF)
 
     assert market is not None
     assert isinstance(market, Market)
@@ -155,10 +155,26 @@ def test_parse_market_yes_no_outcomes() -> None:
         **SAMPLE_MARKET,
         "outcomes": '["Yes", "No"]',
     }
-    market = parse_market(raw)
+    market = parse_market(raw, reference_date=REF)
     assert market is not None
     assert market.up_token_id == "111"
     assert market.down_token_id == "222"
+
+
+def test_parse_window_times_rejects_far_future() -> None:
+    """A market more than 2 days in the future with matching date/time should be rejected."""
+    # "July 1" when ref is Jan 1 2026: Jul 1 2026 is ~180 days out, should reject
+    question = "Bitcoin Up or Down - July 1, 3:00PM-3:05PM ET"
+    ref = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    assert parse_window_times(question, reference_date=ref) is None
+
+
+def test_parse_window_times_rejects_far_past() -> None:
+    """A market more than 1 hour in the past should be rejected."""
+    question = "Bitcoin Up or Down - April 17, 3:00PM-3:05PM ET"
+    # Reference 3 hours after end time
+    ref = datetime(2026, 4, 17, 22, 0, 0, tzinfo=UTC)
+    assert parse_window_times(question, reference_date=ref) is None
 
 
 def test_parse_market_ethereum() -> None:
@@ -167,7 +183,7 @@ def test_parse_market_ethereum() -> None:
         "question": "Ethereum Up or Down - April 17, 3:00PM-3:05PM ET",
         "conditionId": "0xeth999",
     }
-    market = parse_market(raw)
+    market = parse_market(raw, reference_date=REF)
     assert market is not None
     assert market.asset == "ETH"
     assert market.condition_id == "0xeth999"

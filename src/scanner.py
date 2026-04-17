@@ -75,16 +75,20 @@ def fetch_active_markets(limit: int = 500) -> list[dict]:
         return []
 
 
-def is_btc_eth_5min_window(question: str) -> bool:
+def is_btc_eth_5min_window(
+    question: str,
+    reference_date: datetime | None = None,
+) -> bool:
     """Return True iff the question matches a BTC/ETH 5-minute up/down pattern.
 
     Args:
         question: The market question string from the Gamma API.
+        reference_date: UTC datetime used to infer the year. Defaults to now.
 
     Returns:
         True if the question is a valid 5-minute BTC/ETH window.
     """
-    result = parse_window_times(question)
+    result = parse_window_times(question, reference_date=reference_date)
     if result is None:
         return False
     start, end = result
@@ -132,9 +136,9 @@ def parse_window_times(
         if end_utc <= start_utc:
             end_utc += timedelta(days=1)
 
-        # Accept end times up to 7 days in the past or 365 days in the future.
+        # Active markets are always near-term. Accept -1h past to +2 days future.
         delta = (end_utc - ref).total_seconds()
-        if -7 * 86400 <= delta <= 365 * 86400:
+        if -3600 <= delta <= 2 * 86400:
             return start_utc, end_utc
 
     return None
@@ -176,11 +180,15 @@ def _resolve_token_ids(raw: dict) -> tuple[str, str] | None:
     return token_ids[up_idx], token_ids[down_idx]
 
 
-def parse_market(raw: dict) -> "Market | None":
+def parse_market(
+    raw: dict,
+    reference_date: datetime | None = None,
+) -> "Market | None":
     """Parse a Gamma API market dict into a Market.
 
     Args:
         raw: A single market dict from the Gamma API response.
+        reference_date: UTC datetime used to infer the year. Defaults to now.
 
     Returns:
         A Market dataclass, or None if the market is not a BTC/ETH 5-min
@@ -189,10 +197,10 @@ def parse_market(raw: dict) -> "Market | None":
     question = raw.get("question", "")
     logger.debug("Parsing: %s", question)
 
-    if not is_btc_eth_5min_window(question):
+    if not is_btc_eth_5min_window(question, reference_date=reference_date):
         return None
 
-    times = parse_window_times(question)
+    times = parse_window_times(question, reference_date=reference_date)
     if times is None:
         return None
     start_utc, end_utc = times
@@ -240,5 +248,5 @@ def scan() -> list[Market]:
 if __name__ == "__main__":
     markets = scan()
     for m in markets:
-        print(f"{m.asset} {m.start_time:%H:%M}-{m.end_time:%H:%M} UTC  {m.condition_id[:10]}...")
+        print(f"{m.asset} {m.start_time:%m-%d %H:%M}-{m.end_time:%H:%M} UTC  {m.condition_id[:10]}...")
     print(f"\nTotal: {len(markets)} active BTC/ETH 5-min markets")
