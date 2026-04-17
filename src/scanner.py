@@ -1,8 +1,7 @@
-"""Scans Polymarket for eligible BTC/ETH 5-minute up/down markets."""
+"""Scans Polymarket for active BTC/ETH 5-minute up/down markets via series_id."""
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -14,10 +13,20 @@ logger = logging.getLogger(__name__)
 
 UTC = timezone.utc
 
-# Detects asset only — times come from structured API fields, not the question.
-_ASSET_RE = re.compile(r"^(Bitcoin|Ethereum) Up or Down")
+# Series IDs for BTC and ETH 5-minute up/down markets.
+# Discovered via /events?slug=<asset>-updown-5m-<timestamp> then inspecting event.series[0].id.
+# If Polymarket rotates these (rare), rediscover via the same method.
+SERIES_IDS: dict[str, int] = {
+    "BTC": 10684,
+    "ETH": 10683,
+}
 
-_ASSET_MAP = {"Bitcoin": "BTC", "Ethereum": "ETH"}
+# Expected window duration; anything else is rejected.
+WINDOW_DURATION = timedelta(minutes=5)
+
+# Time window acceptance bounds.
+MAX_PAST = timedelta(hours=1)    # reject if endDate is more than this in the past
+MAX_FUTURE = timedelta(days=2)   # reject if eventStartTime is more than this in the future
 
 
 @dataclass(frozen=True)
@@ -33,7 +42,7 @@ class Market:
         up_token_id: CLOB token ID for the Up/Yes outcome.
         down_token_id: CLOB token ID for the Down/No outcome.
         slug: Market URL slug.
-        raw: Original Gamma API response dict, for debugging.
+        raw: Original Gamma API market dict, for debugging.
     """
 
     condition_id: str
@@ -59,68 +68,36 @@ def _parse_iso_utc(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def fetch_active_markets(limit: int = 500) -> list[dict]:
-    """Fetch active, non-closed markets from Gamma API.
+def fetch_events_for_series(series_id: int, limit: int = 200) -> list[dict]:
+    """Fetch non-closed events for a given series_id from the Gamma API.
+
+    Requests are ordered by endDate descending so the freshest markets come
+    first and fill the limit before any stale zombie entries.
 
     Args:
-        limit: Maximum number of markets to request.
+        series_id: The Polymarket series ID (e.g. 10684 for BTC 5m).
+        limit: Max events to return.
 
     Returns:
-        List of raw market dicts. Empty list on any error.
+        List of raw event dicts. Empty list on any error.
     """
     url = (
-        f"{config.GAMMA_URL}/markets"
-        f"?limit={limit}&active=true&closed=false&order=endDate&ascending=true"
+        f"{config.GAMMA_URL}/events"
+        f"?series_id={series_id}&closed=false"
+        f"&order=endDate&ascending=false&limit={limit}"
     )
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
-            logger.warning("Gamma API returned %s: %s", resp.status_code, resp.text[:200])
+            logger.warning(
+                "Gamma API (series_id=%d) returned %s: %s",
+                series_id, resp.status_code, resp.text[:200],
+            )
             return []
         return resp.json()
     except Exception as exc:
-        logger.warning("Failed to fetch markets: %s", exc)
+        logger.warning("Failed to fetch events for series_id=%d: %s", series_id, exc)
         return []
-
-
-def is_btc_eth_5min_window(
-    raw: dict,
-    reference_date: datetime | None = None,
-) -> bool:
-    """Return True iff the market dict represents a BTC/ETH 5-minute up/down window.
-
-    Args:
-        raw: A single market dict from the Gamma API response.
-        reference_date: UTC datetime used as "now" for staleness checks. Defaults to now.
-
-    Returns:
-        True iff all of these hold:
-        1. Question matches Bitcoin/Ethereum "Up or Down" pattern.
-        2. Both eventStartTime and endDate are present and valid ISO-8601.
-        3. endDate - eventStartTime == exactly 5 minutes.
-        4. endDate is not more than 1 hour in the past.
-        5. eventStartTime is not more than 2 days in the future.
-    """
-    question = raw.get("question", "")
-    if not _ASSET_RE.match(question):
-        return False
-
-    try:
-        start = _parse_iso_utc(raw["eventStartTime"])
-        end = _parse_iso_utc(raw["endDate"])
-    except (KeyError, ValueError):
-        return False
-
-    if end - start != timedelta(minutes=5):
-        return False
-
-    ref = reference_date or datetime.now(UTC)
-    if (end - ref).total_seconds() < -3600:
-        return False
-    if (start - ref).total_seconds() > 2 * 86400:
-        return False
-
-    return True
 
 
 def _resolve_token_ids(raw: dict) -> tuple[str, str] | None:
@@ -159,116 +136,130 @@ def _resolve_token_ids(raw: dict) -> tuple[str, str] | None:
     return token_ids[up_idx], token_ids[down_idx]
 
 
-def _try_parse_market(
-    raw: dict,
+def _try_parse_event_market(
+    event: dict,
+    asset: str,
     reference_date: datetime | None = None,
 ) -> tuple["Market | None", "str | None"]:
-    """Parse a Gamma API market dict, returning a reason string on failure.
+    """Try to extract a valid Market from an event dict.
+
+    An event contains a `markets` array; for 5-min up/down series, there is
+    always exactly one market per event.
 
     Args:
-        raw: A single market dict from the Gamma API response.
-        reference_date: UTC datetime used as "now". Defaults to now.
+        event: Raw event dict from /events?series_id=...
+        asset: "BTC" or "ETH" — known from which series we queried.
+        reference_date: UTC datetime for freshness checks. Defaults to now.
 
     Returns:
-        (Market, None) on success, or (None, reason) on failure where reason is
-        one of: "wrong_asset", "missing_dates", "wrong_window_size", "stale",
-        "too_far_future", "missing_tokens".
+        (Market, None) on success, or (None, reason) on failure.
+        Reason is one of: "no_markets", "missing_dates", "wrong_window_size",
+        "stale", "too_far_future", "missing_tokens".
     """
-    question = raw.get("question", "")
-    logger.debug("Parsing: %s", question)
+    ref = reference_date or datetime.now(UTC)
 
-    asset_match = _ASSET_RE.match(question)
-    if not asset_match:
-        return None, "wrong_asset"
+    markets = event.get("markets") or []
+    if not markets:
+        return None, "no_markets"
 
-    try:
-        start = _parse_iso_utc(raw["eventStartTime"])
-        end = _parse_iso_utc(raw["endDate"])
-    except (KeyError, ValueError):
+    # Each 5-min up/down event has exactly one market; take the first.
+    market_raw = markets[0]
+
+    event_start = market_raw.get("eventStartTime") or event.get("eventStartTime")
+    end_date = market_raw.get("endDate") or event.get("endDate")
+
+    if not event_start or not end_date:
         return None, "missing_dates"
 
-    if end - start != timedelta(minutes=5):
+    try:
+        start_utc = _parse_iso_utc(event_start)
+        end_utc = _parse_iso_utc(end_date)
+    except (ValueError, TypeError):
+        return None, "missing_dates"
+
+    if (end_utc - start_utc) != WINDOW_DURATION:
         return None, "wrong_window_size"
 
-    ref = reference_date or datetime.now(UTC)
-    if (end - ref).total_seconds() < -3600:
+    if (ref - end_utc) > MAX_PAST:
         return None, "stale"
-    if (start - ref).total_seconds() > 2 * 86400:
+
+    if (start_utc - ref) > MAX_FUTURE:
         return None, "too_far_future"
 
-    token_pair = _resolve_token_ids(raw)
+    token_pair = _resolve_token_ids(market_raw)
     if token_pair is None:
-        logger.warning("Missing/bad token IDs for: %s", question)
+        logger.warning("Missing/bad token IDs for market in event: %s", event.get("slug", "?"))
         return None, "missing_tokens"
     up_token_id, down_token_id = token_pair
 
-    asset = _ASSET_MAP[asset_match.group(1)]
-
     return Market(
-        condition_id=raw.get("conditionId", ""),
-        question=question,
+        condition_id=market_raw.get("conditionId", ""),
+        question=market_raw.get("question", ""),
         asset=asset,
-        start_time=start,
-        end_time=end,
+        start_time=start_utc,
+        end_time=end_utc,
         up_token_id=up_token_id,
         down_token_id=down_token_id,
-        slug=raw.get("slug", ""),
-        raw=raw,
+        slug=market_raw.get("slug") or event.get("slug", ""),
+        raw=market_raw,
     ), None
 
 
-def parse_market(
-    raw: dict,
+def parse_event_market(
+    event: dict,
+    asset: str,
     reference_date: datetime | None = None,
 ) -> "Market | None":
-    """Parse a Gamma API market dict into a Market.
+    """Public wrapper around _try_parse_event_market — returns Market or None.
 
     Args:
-        raw: A single market dict from the Gamma API response.
-        reference_date: UTC datetime used as "now". Defaults to now.
+        event: Raw event dict from /events?series_id=...
+        asset: "BTC" or "ETH".
+        reference_date: UTC datetime for freshness checks. Defaults to now.
 
     Returns:
-        A Market dataclass, or None if the market is not a valid BTC/ETH 5-min
-        up/down market or required fields are missing/malformed.
+        A Market dataclass, or None if the event is invalid or out of window.
     """
-    market, _ = _try_parse_market(raw, reference_date)
+    market, _ = _try_parse_event_market(event, asset, reference_date)
     return market
 
 
 def scan(reference_date: datetime | None = None) -> list[Market]:
-    """Fetch and parse all active BTC/ETH 5-minute markets.
+    """Fetch and parse all active BTC/ETH 5-minute markets across configured series.
 
     Args:
         reference_date: UTC datetime used as "now" for staleness checks. Defaults to now.
 
     Returns:
-        List of parsed Market objects, sorted by end_time ascending.
+        List of Market objects sorted by end_time ascending.
     """
-    raw_markets = fetch_active_markets()
-    markets: list[Market] = []
+    all_markets: list[Market] = []
     rejected: dict[str, int] = {
-        "wrong_asset": 0,
+        "no_markets": 0,
+        "missing_dates": 0,
         "wrong_window_size": 0,
         "stale": 0,
         "too_far_future": 0,
-        "missing_dates": 0,
         "missing_tokens": 0,
     }
+    total_events = 0
 
-    for raw in raw_markets:
-        market, reason = _try_parse_market(raw, reference_date)
-        if market is not None:
-            markets.append(market)
-        elif reason is not None:
-            rejected[reason] = rejected.get(reason, 0) + 1
+    for asset, series_id in SERIES_IDS.items():
+        events = fetch_events_for_series(series_id)
+        total_events += len(events)
+        for event in events:
+            market, reason = _try_parse_event_market(event, asset, reference_date)
+            if market is not None:
+                all_markets.append(market)
+            elif reason is not None:
+                rejected[reason] = rejected.get(reason, 0) + 1
 
+    rejected_summary = ", ".join(f"{k}={v}" for k, v in rejected.items() if v > 0)
     logger.info(
-        "Scanner: %d total, %d kept, rejected: %s",
-        len(raw_markets),
-        len(markets),
-        ", ".join(f"{k}={v}" for k, v in rejected.items() if v > 0),
+        "Scanner: %d events across %d series, %d markets kept, rejected: %s",
+        total_events, len(SERIES_IDS), len(all_markets), rejected_summary or "none",
     )
-    return sorted(markets, key=lambda m: m.end_time)
+    return sorted(all_markets, key=lambda m: m.end_time)
 
 
 if __name__ == "__main__":

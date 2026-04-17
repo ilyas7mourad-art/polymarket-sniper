@@ -4,9 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 from src.scanner import (
     Market,
+    SERIES_IDS,
     _parse_iso_utc,
-    is_btc_eth_5min_window,
-    parse_market,
+    _try_parse_event_market,
+    parse_event_market,
 )
 
 UTC = timezone.utc
@@ -15,20 +16,41 @@ UTC = timezone.utc
 # Fixtures
 # ---------------------------------------------------------------------------
 
-SAMPLE_MARKET = {
-    "conditionId": "0xabc123def456",
-    "question": "Bitcoin Up or Down - April 17, 3:00PM-3:05PM ET",
-    "clobTokenIds": '["111", "222"]',
-    "outcomes": '["Up", "Down"]',
-    "slug": "btc-up-or-down-april-17-3pm-3-05pm-et",
-    "eventStartTime": "2026-04-17T19:00:00Z",
-    "endDate": "2026-04-17T19:05:00Z",
-    "active": True,
-    "closed": False,
-}
+# Reference date pinned so tests don't drift with the calendar.
+REF = datetime(2026, 4, 17, 23, 0, 0, tzinfo=UTC)
 
-# 5 minutes before the window opens — market is active and near-term.
-REF = datetime(2026, 4, 17, 18, 55, 0, tzinfo=UTC)
+
+def _make_event(
+    event_start: str = "2026-04-17T23:05:00Z",
+    end_date: str = "2026-04-17T23:10:00Z",
+    clob_token_ids: str = '["111", "222"]',
+    outcomes: str = '["Up", "Down"]',
+    question: str = "Bitcoin Up or Down - April 17, 7:05PM-7:10PM ET",
+    condition_id: str = "0xabc123",
+    slug: str = "btc-updown-5m-1776467100",
+    include_market: bool = True,
+) -> dict:
+    """Build a realistic event dict mirroring Gamma API structure."""
+    event: dict = {
+        "slug": slug,
+        "eventStartTime": None,   # event-level field is None in real API
+        "endDate": end_date,
+        "active": True,
+        "closed": False,
+    }
+    if include_market:
+        event["markets"] = [{
+            "conditionId": condition_id,
+            "question": question,
+            "clobTokenIds": clob_token_ids,
+            "outcomes": outcomes,
+            "slug": slug,
+            "eventStartTime": event_start,
+            "endDate": end_date,
+        }]
+    else:
+        event["markets"] = []
+    return event
 
 
 # ---------------------------------------------------------------------------
@@ -39,165 +61,124 @@ REF = datetime(2026, 4, 17, 18, 55, 0, tzinfo=UTC)
 def test_parse_iso_utc_handles_z_suffix() -> None:
     dt = _parse_iso_utc("2026-04-17T19:00:00Z")
     assert dt.tzinfo is not None
-    assert dt.year == 2026
-    assert dt.month == 4
-    assert dt.day == 17
-    assert dt.hour == 19
-    assert dt.minute == 0
-    assert dt.second == 0
+    assert dt == datetime(2026, 4, 17, 19, 0, tzinfo=UTC)
 
 
 def test_parse_iso_utc_handles_offset_suffix() -> None:
-    dt = _parse_iso_utc("2026-04-17T19:00:00+00:00")
-    assert dt == _parse_iso_utc("2026-04-17T19:00:00Z")
+    assert _parse_iso_utc("2026-04-17T19:00:00+00:00") == _parse_iso_utc("2026-04-17T19:00:00Z")
 
 
 # ---------------------------------------------------------------------------
-# is_btc_eth_5min_window
+# SERIES_IDS
 # ---------------------------------------------------------------------------
 
 
-def test_is_btc_eth_5min_window_accepts_valid() -> None:
-    cases = [
-        # BTC, standard 5-min window
-        (SAMPLE_MARKET, REF),
-        # ETH, different time
-        (
-            {**SAMPLE_MARKET, "question": "Ethereum Up or Down - April 17, 3:05PM-3:10PM ET",
-             "eventStartTime": "2026-04-17T19:05:00Z", "endDate": "2026-04-17T19:10:00Z"},
-            REF,
-        ),
-        # BTC, early morning window
-        (
-            {**SAMPLE_MARKET, "question": "Bitcoin Up or Down - April 18, 9:00AM-9:05AM ET",
-             "eventStartTime": "2026-04-18T13:00:00Z", "endDate": "2026-04-18T13:05:00Z"},
-            datetime(2026, 4, 18, 12, 55, 0, tzinfo=UTC),
-        ),
-        # ETH, within 1h of ref (just started)
-        (
-            {**SAMPLE_MARKET, "question": "Ethereum Up or Down - April 17, 2:55PM-3:00PM ET",
-             "eventStartTime": "2026-04-17T18:55:00Z", "endDate": "2026-04-17T19:00:00Z"},
-            REF,
-        ),
-    ]
-    for raw, ref in cases:
-        assert is_btc_eth_5min_window(raw, reference_date=ref), (
-            f"Expected True for: {raw['question']}"
-        )
-
-
-def test_is_btc_eth_5min_window_rejects_invalid() -> None:
-    cases = [
-        # Wrong asset
-        ({**SAMPLE_MARKET, "question": "Solana Up or Down - April 17, 3:00PM-3:05PM ET"}, REF),
-        # Unrecognised format
-        ({**SAMPLE_MARKET, "question": "Bitcoin goes up"}, REF),
-        # Empty question
-        ({**SAMPLE_MARKET, "question": ""}, REF),
-        # 10-minute window
-        ({**SAMPLE_MARKET, "endDate": "2026-04-17T19:10:00Z"}, REF),
-        # 15-minute window
-        ({**SAMPLE_MARKET, "endDate": "2026-04-17T19:15:00Z"}, REF),
-        # Stale: endDate 2h before REF (REF=18:55, end=16:55)
-        (
-            {**SAMPLE_MARKET,
-             "eventStartTime": "2026-04-17T16:50:00Z",
-             "endDate": "2026-04-17T16:55:00Z"},
-            REF,
-        ),
-        # Far future: eventStartTime 3 days after REF
-        (
-            {**SAMPLE_MARKET,
-             "eventStartTime": "2026-04-20T19:00:00Z",
-             "endDate": "2026-04-20T19:05:00Z"},
-            REF,
-        ),
-        # Missing eventStartTime
-        ({k: v for k, v in SAMPLE_MARKET.items() if k != "eventStartTime"}, REF),
-        # Missing endDate
-        ({k: v for k, v in SAMPLE_MARKET.items() if k != "endDate"}, REF),
-    ]
-    for raw, ref in cases:
-        assert not is_btc_eth_5min_window(raw, reference_date=ref), (
-            f"Expected False for: {raw.get('question')}"
-        )
+def test_series_ids_contains_btc_and_eth() -> None:
+    assert "BTC" in SERIES_IDS and "ETH" in SERIES_IDS
+    assert isinstance(SERIES_IDS["BTC"], int)
+    assert isinstance(SERIES_IDS["ETH"], int)
 
 
 # ---------------------------------------------------------------------------
-# parse_market
+# _try_parse_event_market / parse_event_market
 # ---------------------------------------------------------------------------
 
 
-def test_parse_market_returns_none_on_missing_token_ids() -> None:
-    raw = {k: v for k, v in SAMPLE_MARKET.items() if k != "clobTokenIds"}
-    assert parse_market(raw, reference_date=REF) is None
+def test_parse_event_market_happy_path_btc() -> None:
+    event = _make_event()
+    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
 
-
-def test_parse_market_returns_none_on_non_5min() -> None:
-    raw = {**SAMPLE_MARKET, "endDate": "2026-04-17T19:10:00Z"}
-    assert parse_market(raw, reference_date=REF) is None
-
-
-def test_parse_market_rejects_missing_event_start_time() -> None:
-    raw = {k: v for k, v in SAMPLE_MARKET.items() if k != "eventStartTime"}
-    assert parse_market(raw, reference_date=REF) is None
-
-
-def test_parse_market_rejects_stale() -> None:
-    raw = {
-        **SAMPLE_MARKET,
-        "eventStartTime": "2026-04-17T16:50:00Z",
-        "endDate": "2026-04-17T16:55:00Z",
-    }
-    assert parse_market(raw, reference_date=REF) is None
-
-
-def test_parse_market_rejects_far_future() -> None:
-    raw = {
-        **SAMPLE_MARKET,
-        "eventStartTime": "2026-04-20T19:00:00Z",
-        "endDate": "2026-04-20T19:05:00Z",
-    }
-    assert parse_market(raw, reference_date=REF) is None
-
-
-def test_parse_market_happy_path() -> None:
-    market = parse_market(SAMPLE_MARKET, reference_date=REF)
-
+    assert reason is None
     assert market is not None
     assert isinstance(market, Market)
-
-    assert market.condition_id == "0xabc123def456"
     assert market.asset == "BTC"
+    assert market.condition_id == "0xabc123"
     assert market.up_token_id == "111"
     assert market.down_token_id == "222"
-    assert market.slug == "btc-up-or-down-april-17-3pm-3-05pm-et"
-
-    assert market.start_time == datetime(2026, 4, 17, 19, 0, tzinfo=UTC)
-    assert market.end_time == datetime(2026, 4, 17, 19, 5, tzinfo=UTC)
+    assert market.start_time == datetime(2026, 4, 17, 23, 5, tzinfo=UTC)
+    assert market.end_time == datetime(2026, 4, 17, 23, 10, tzinfo=UTC)
     assert market.end_time - market.start_time == timedelta(minutes=5)
-
-    assert market.raw is SAMPLE_MARKET
-
-
-def test_parse_market_yes_no_outcomes() -> None:
-    """Markets that use Yes/No instead of Up/Down should still map correctly."""
-    raw = {**SAMPLE_MARKET, "outcomes": '["Yes", "No"]'}
-    market = parse_market(raw, reference_date=REF)
-    assert market is not None
-    assert market.up_token_id == "111"
-    assert market.down_token_id == "222"
+    assert market.start_time.tzinfo is not None
 
 
-def test_parse_market_ethereum() -> None:
-    raw = {
-        **SAMPLE_MARKET,
-        "question": "Ethereum Up or Down - April 17, 3:00PM-3:05PM ET",
-        "conditionId": "0xeth999",
-    }
-    market = parse_market(raw, reference_date=REF)
+def test_parse_event_market_happy_path_eth() -> None:
+    event = _make_event(
+        question="Ethereum Up or Down - April 17, 7:05PM-7:10PM ET",
+    )
+    market, reason = _try_parse_event_market(event, "ETH", reference_date=REF)
+
+    assert reason is None
     assert market is not None
     assert market.asset == "ETH"
-    assert market.condition_id == "0xeth999"
-    assert market.start_time == datetime(2026, 4, 17, 19, 0, tzinfo=UTC)
-    assert market.end_time == datetime(2026, 4, 17, 19, 5, tzinfo=UTC)
+    assert market.start_time == datetime(2026, 4, 17, 23, 5, tzinfo=UTC)
+    assert market.end_time == datetime(2026, 4, 17, 23, 10, tzinfo=UTC)
+
+
+def test_parse_event_market_rejects_no_markets() -> None:
+    event = _make_event(include_market=False)
+    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    assert market is None
+    assert reason == "no_markets"
+
+
+def test_parse_event_market_rejects_missing_dates() -> None:
+    event = _make_event(event_start="", end_date="")
+    # Both fields are empty strings — parser should return missing_dates
+    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    assert market is None
+    assert reason == "missing_dates"
+
+
+def test_parse_event_market_rejects_wrong_window() -> None:
+    # 10-minute span instead of 5
+    event = _make_event(end_date="2026-04-17T23:15:00Z")
+    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    assert market is None
+    assert reason == "wrong_window_size"
+
+
+def test_parse_event_market_rejects_stale() -> None:
+    # endDate 2 hours before REF (REF = 23:00, end = 21:05 → stale by >1h)
+    event = _make_event(
+        event_start="2026-04-17T21:00:00Z",
+        end_date="2026-04-17T21:05:00Z",
+    )
+    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    assert market is None
+    assert reason == "stale"
+
+
+def test_parse_event_market_rejects_too_far_future() -> None:
+    # eventStartTime 3 days after REF
+    event = _make_event(
+        event_start="2026-04-20T23:05:00Z",
+        end_date="2026-04-20T23:10:00Z",
+    )
+    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    assert market is None
+    assert reason == "too_far_future"
+
+
+def test_parse_event_market_rejects_missing_tokens() -> None:
+    event = _make_event(clob_token_ids="")
+    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    assert market is None
+    assert reason == "missing_tokens"
+
+
+def test_parse_event_market_yes_no_outcomes() -> None:
+    """Markets that use Yes/No instead of Up/Down should still map correctly."""
+    event = _make_event(outcomes='["Yes", "No"]')
+    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    assert reason is None
+    assert market is not None
+    assert market.up_token_id == "111"
+    assert market.down_token_id == "222"
+
+
+def test_parse_event_market_public_wrapper() -> None:
+    """parse_event_market returns a Market (not a tuple)."""
+    event = _make_event()
+    result = parse_event_market(event, "BTC", reference_date=REF)
+    assert isinstance(result, Market)
+    assert result.asset == "BTC"
