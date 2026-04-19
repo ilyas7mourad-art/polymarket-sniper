@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+DEFAULT_FEE_RATE = 0.02
+
 import pandas as pd
 
 
@@ -186,11 +188,14 @@ class BucketStats:
     n_wins: int
     win_rate: float         # wins / samples
     avg_entry_ask: float    # mean best_ask within this bucket
+    naive_ev: float         # win_rate - avg_entry_ask
+    fee_adjusted_ev: float  # win_rate * (1 - fee_rate) - avg_entry_ask
 
 
 def compute_win_rates_by_bucket(
     snapshots: list[EntrySnapshot],
     buckets: list[tuple[float, float]],
+    fee_rate: float = DEFAULT_FEE_RATE,
 ) -> list[BucketStats]:
     """Bucket snapshots by best_ask price and compute win rate per bucket.
 
@@ -216,19 +221,24 @@ def compute_win_rates_by_bucket(
                 n_wins=0,
                 win_rate=0.0,
                 avg_entry_ask=0.0,
+                naive_ev=0.0,
+                fee_adjusted_ev=0.0,
             ))
             continue
 
         wins = sum(1 for s in in_bucket if s.side == s.eventual_winner)
         avg_ask = sum(s.best_ask for s in in_bucket) / n
+        win_rate = wins / n
         results.append(BucketStats(
             bucket_label=label,
             lower=lower,
             upper=upper,
             n_samples=n,
             n_wins=wins,
-            win_rate=wins / n,
+            win_rate=win_rate,
             avg_entry_ask=avg_ask,
+            naive_ev=win_rate - avg_ask,
+            fee_adjusted_ev=win_rate * (1 - fee_rate) - avg_ask,
         ))
 
     return results

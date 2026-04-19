@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from src.analysis import (
+    DEFAULT_FEE_RATE,
     BucketStats,
     EntrySnapshot,
     MarketOutcome,
@@ -248,3 +249,68 @@ def test_compute_win_rates_by_bucket_empty_bucket_omitted_or_zero() -> None:
     assert empty.n_samples == 0
     assert empty.n_wins == 0
     assert empty.win_rate == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 9. Fee modeling — DEFAULT_FEE_RATE constant
+# ---------------------------------------------------------------------------
+
+
+def test_default_fee_rate_is_0_02() -> None:
+    assert DEFAULT_FEE_RATE == 0.02
+
+
+# ---------------------------------------------------------------------------
+# 10. Fee modeling — BucketStats has naive_ev and fee_adjusted_ev fields
+# ---------------------------------------------------------------------------
+
+
+def test_bucket_stats_has_ev_fields() -> None:
+    snaps = [_make_snapshot("Up", 0.62, "Up")]
+    stats = compute_win_rates_by_bucket(snaps, [(0.60, 0.65)])
+    s = stats[0]
+    assert hasattr(s, "naive_ev")
+    assert hasattr(s, "fee_adjusted_ev")
+
+
+# ---------------------------------------------------------------------------
+# 11. Fee modeling — naive_ev = win_rate - avg_entry_ask
+# ---------------------------------------------------------------------------
+
+
+def test_naive_ev_formula() -> None:
+    # 2/4 win → win_rate=0.5, avg_ask=0.62
+    snaps = [_make_snapshot("Up", 0.62, "Up")] * 2 + [_make_snapshot("Up", 0.62, "Down")] * 2
+    stats = compute_win_rates_by_bucket(snaps, [(0.60, 0.65)])
+    s = stats[0]
+    assert abs(s.naive_ev - (s.win_rate - s.avg_entry_ask)) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# 12. Fee modeling — fee_adjusted_ev = win_rate * (1 - fee_rate) - avg_entry_ask
+# ---------------------------------------------------------------------------
+
+
+def test_fee_adjusted_ev_formula() -> None:
+    # 3/4 win → win_rate=0.75, avg_ask=0.62, fee=0.02
+    # fee_adjusted_ev = 0.75 * 0.98 - 0.62 = 0.735 - 0.62 = 0.115
+    snaps = [_make_snapshot("Up", 0.62, "Up")] * 3 + [_make_snapshot("Up", 0.62, "Down")]
+    stats = compute_win_rates_by_bucket(snaps, [(0.60, 0.65)])
+    s = stats[0]
+    expected = s.win_rate * (1 - DEFAULT_FEE_RATE) - s.avg_entry_ask
+    assert abs(s.fee_adjusted_ev - expected) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# 13. Fee modeling — custom fee_rate overrides default
+# ---------------------------------------------------------------------------
+
+
+def test_custom_fee_rate_applied() -> None:
+    # win_rate=1.0, avg_ask=0.62, fee=0.10 → fee_adj_ev = 1.0*0.90 - 0.62 = 0.28
+    snaps = [_make_snapshot("Up", 0.62, "Up")] * 4
+    stats = compute_win_rates_by_bucket(snaps, [(0.60, 0.65)], fee_rate=0.10)
+    s = stats[0]
+    assert abs(s.fee_adjusted_ev - (1.0 * 0.90 - 0.62)) < 1e-9
+    # naive_ev should be unaffected by fee_rate
+    assert abs(s.naive_ev - (1.0 - 0.62)) < 1e-9
