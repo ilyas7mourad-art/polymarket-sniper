@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.analysis import (
+    DEFAULT_FEE_RATE,
     BucketStats,
     EntrySnapshot,
     compute_win_rates_by_bucket,
@@ -38,20 +39,18 @@ TARGET_SECONDS: list[float] = [120.0, 60.0, 30.0, 10.0]
 
 
 def _bucket_table(stats: list[BucketStats]) -> str:
-    header = "| bucket | N | wins | win rate | avg ask | EV (naive) |"
-    sep = "|--------|---|------|----------|---------|------------|"
+    header = f"| bucket | N | wins | win rate | avg ask | EV (naive) | EV (fee={DEFAULT_FEE_RATE:.0%}) |"
+    sep = "|--------|---|------|----------|---------|------------|--------------|"
     rows = [header, sep]
     for s in stats:
         if s.n_samples == 0:
-            ev_str = "—"
-            wr_str = "—"
+            rows.append(
+                f"| {s.bucket_label} | 0 | 0 | — | {s.avg_entry_ask:.4f} | — | — |"
+            )
         else:
-            ev = s.win_rate - s.avg_entry_ask
-            ev_str = f"{ev:+.4f}"
-            wr_str = f"{s.win_rate:.1%}"
-        rows.append(
-            f"| {s.bucket_label} | {s.n_samples} | {s.n_wins} | {wr_str} | {s.avg_entry_ask:.4f} | {ev_str} |"
-        )
+            rows.append(
+                f"| {s.bucket_label} | {s.n_samples} | {s.n_wins} | {s.win_rate:.1%} | {s.avg_entry_ask:.4f} | {s.naive_ev:+.4f} | {s.fee_adjusted_ev:+.4f} |"
+            )
     return "\n".join(rows)
 
 
@@ -171,7 +170,7 @@ def main() -> None:
     emit(f"2. **Samples with best_ask ≥ 0.90:** {total_high_ask_samples} (across all target times)")
     emit()
 
-    emit("3. **Naive EV per trade by bucket** (win_rate − avg_ask; ignores fees/slippage):")
+    emit(f"3. **Fee-adjusted EV per trade by bucket** (win_rate × (1 − {DEFAULT_FEE_RATE:.0%}) − avg_ask):")
     emit()
     for t in TARGET_SECONDS:
         stats = per_target.get(t, [])
@@ -181,8 +180,7 @@ def main() -> None:
         for s in stats:
             if s.n_samples == 0:
                 continue
-            ev = s.win_rate - s.avg_entry_ask
-            emit(f"   - {s.bucket_label}: EV = {ev:+.4f} (win_rate={s.win_rate:.1%}, avg_ask={s.avg_entry_ask:.4f}, N={s.n_samples})")
+            emit(f"   - {s.bucket_label}: fee_adj_EV = {s.fee_adjusted_ev:+.4f}, naive_EV = {s.naive_ev:+.4f} (win_rate={s.win_rate:.1%}, avg_ask={s.avg_entry_ask:.4f}, N={s.n_samples})")
         emit()
 
     _write_report(data_dir, lines)
