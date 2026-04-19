@@ -1,5 +1,6 @@
 """Configuration loader for the Polymarket sniper bot."""
 
+import logging
 import os
 from pathlib import Path
 
@@ -36,3 +37,8 @@ class Config:
 
 
 config = Config()
+
+logging.basicConfig(
+    level=config.LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
