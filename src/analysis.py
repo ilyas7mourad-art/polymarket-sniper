@@ -64,8 +64,12 @@ def load_ticks(csv_paths: list[Path]) -> pd.DataFrame:
 def determine_winners(df: pd.DataFrame) -> dict[str, MarketOutcome]:
     """For each condition_id, determine which side won.
 
-    Heuristic: a market is "resolved Up" if the LAST tick for the Up side
-    has mid >= 0.95 AND the Down side's last mid <= 0.05. Vice versa for Down.
+    We take the post-resolution tick (smallest / most-negative seconds_to_resolution)
+    for each side. The observer logs a few seconds past resolution, so the last
+    tick we see has the settled state: one side pinned at ~1.00, the other at ~0.00.
+
+    Heuristic: a market is "resolved Up" if the post-resolution Up mid >= 0.95
+    AND the post-resolution Down mid <= 0.05. Vice versa for Down.
     If neither condition holds, winner is "unknown".
 
     Returns dict keyed by condition_id.
