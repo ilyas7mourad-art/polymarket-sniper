@@ -7,10 +7,13 @@ import pandas as pd
 import pytest
 
 from src.analysis import (
+    CATEGORY_FEE_RATES,
+    DEFAULT_CATEGORY,
     DEFAULT_FEE_RATE,
     BucketStats,
     EntrySnapshot,
     MarketOutcome,
+    compute_taker_fee,
     compute_win_rates_by_bucket,
     determine_winners,
     extract_entry_snapshots,
@@ -256,8 +259,10 @@ def test_compute_win_rates_by_bucket_empty_bucket_omitted_or_zero() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_default_fee_rate_is_0_02() -> None:
-    assert DEFAULT_FEE_RATE == 0.02
+def test_default_fee_rate_is_crypto_rate() -> None:
+    assert DEFAULT_CATEGORY == "crypto"
+    assert DEFAULT_FEE_RATE == CATEGORY_FEE_RATES["crypto"]
+    assert DEFAULT_FEE_RATE == 0.072
 
 
 # ---------------------------------------------------------------------------
@@ -292,12 +297,14 @@ def test_naive_ev_formula() -> None:
 
 
 def test_fee_adjusted_ev_formula() -> None:
-    # 3/4 win → win_rate=0.75, avg_ask=0.62, fee=0.02
-    # fee_adjusted_ev = 0.75 * 0.98 - 0.62 = 0.735 - 0.62 = 0.115
+    # 3/4 win → win_rate=0.75, avg_ask=0.62, crypto rate 0.072
+    # fee_per_share = 0.072 × 0.62 × 0.38 = 0.072 × 0.2356 = 0.0169632
+    # fee_adjusted_ev = 0.75 × (1 - 0.0169632) - 0.62
     snaps = [_make_snapshot("Up", 0.62, "Up")] * 3 + [_make_snapshot("Up", 0.62, "Down")]
     stats = compute_win_rates_by_bucket(snaps, [(0.60, 0.65)])
     s = stats[0]
-    expected = s.win_rate * (1 - DEFAULT_FEE_RATE) - s.avg_entry_ask
+    fee_per_share = DEFAULT_FEE_RATE * 0.62 * (1 - 0.62)
+    expected = s.win_rate * (1 - fee_per_share) - s.avg_entry_ask
     assert abs(s.fee_adjusted_ev - expected) < 1e-9
 
 
@@ -307,10 +314,93 @@ def test_fee_adjusted_ev_formula() -> None:
 
 
 def test_custom_fee_rate_applied() -> None:
-    # win_rate=1.0, avg_ask=0.62, fee=0.10 → fee_adj_ev = 1.0*0.90 - 0.62 = 0.28
+    # win_rate=1.0, avg_ask=0.62, custom fee_rate=0.10
+    # fee_per_share = 0.10 × 0.62 × 0.38 = 0.02356
+    # fee_adjusted_ev = 1.0 × (1 - 0.02356) - 0.62 = 0.35644
     snaps = [_make_snapshot("Up", 0.62, "Up")] * 4
     stats = compute_win_rates_by_bucket(snaps, [(0.60, 0.65)], fee_rate=0.10)
     s = stats[0]
-    assert abs(s.fee_adjusted_ev - (1.0 * 0.90 - 0.62)) < 1e-9
+    fee_per_share = 0.10 * 0.62 * (1 - 0.62)
+    assert abs(s.fee_adjusted_ev - (1.0 * (1 - fee_per_share) - 0.62)) < 1e-9
     # naive_ev should be unaffected by fee_rate
     assert abs(s.naive_ev - (1.0 - 0.62)) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# 14. compute_taker_fee — peaks at 0.50
+# ---------------------------------------------------------------------------
+
+
+def test_compute_taker_fee_at_50_peaks() -> None:
+    # fee = 100 × 0.072 × 0.50 × 0.50 = 1.8
+    assert abs(compute_taker_fee(0.50, 100) - 1.8) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# 15. compute_taker_fee — tiny at 0.99
+# ---------------------------------------------------------------------------
+
+
+def test_compute_taker_fee_at_99_tiny() -> None:
+    # fee = 100 × 0.072 × 0.99 × 0.01 = 0.07128
+    assert abs(compute_taker_fee(0.99, 100) - 0.07128) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# 16. compute_taker_fee — symmetric around 0.50
+# ---------------------------------------------------------------------------
+
+
+def test_compute_taker_fee_symmetric_around_50() -> None:
+    assert abs(compute_taker_fee(0.30, 100) - compute_taker_fee(0.70, 100)) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 17. compute_taker_fee — zero at endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_compute_taker_fee_zero_at_endpoints() -> None:
+    assert compute_taker_fee(0.0, 100) == 0.0
+    assert compute_taker_fee(1.0, 100) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 18. compute_taker_fee — custom category rate
+# ---------------------------------------------------------------------------
+
+
+def test_compute_taker_fee_custom_category() -> None:
+    # Sports rate = 0.03 at price=0.50 → 100 × 0.03 × 0.25 = 0.75
+    sports_rate = CATEGORY_FEE_RATES["sports"]
+    assert abs(compute_taker_fee(0.50, 100, fee_rate=sports_rate) - 0.75) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# 19. fee_adjusted_ev uses real parabolic formula — high price (0.99 bucket)
+# ---------------------------------------------------------------------------
+
+
+def test_fee_adjusted_ev_uses_real_formula() -> None:
+    # 98% win rate at avg_ask=0.99, crypto rate 0.072
+    # fee_per_share = 0.072 × 0.99 × 0.01 = 0.0007128
+    # EV = 0.98 × (1 - 0.0007128) - 0.99
+    snaps = [_make_snapshot("Up", 0.99, "Up")] * 98 + [_make_snapshot("Up", 0.99, "Down")] * 2
+    stats = compute_win_rates_by_bucket(snaps, [(0.95, 1.00)])
+    expected = 0.98 * (1 - 0.072 * 0.99 * 0.01) - 0.99
+    assert abs(stats[0].fee_adjusted_ev - expected) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# 20. fee_adjusted_ev worst case — mid price (0.50 bucket)
+# ---------------------------------------------------------------------------
+
+
+def test_fee_adjusted_ev_mid_price_worst_case() -> None:
+    # 70% win rate at avg_ask=0.50, crypto rate 0.072
+    # fee_per_share = 0.072 × 0.50 × 0.50 = 0.018
+    # EV = 0.70 × (1 - 0.018) - 0.50
+    snaps = [_make_snapshot("Up", 0.50, "Up")] * 7 + [_make_snapshot("Up", 0.50, "Down")] * 3
+    stats = compute_win_rates_by_bucket(snaps, [(0.45, 0.55)])
+    expected = 0.70 * (1 - 0.072 * 0.50 * 0.50) - 0.50
+    assert abs(stats[0].fee_adjusted_ev - expected) < 1e-5
