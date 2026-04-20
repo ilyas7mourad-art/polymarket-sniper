@@ -28,6 +28,11 @@ _CLOB_MARKETS_URL = "https://clob.polymarket.com/markets"
 # Simulated stake per trade (USDC). Chosen for clean math in logs.
 STAKE_USDC = 1.0
 
+# Resolution timing constants.
+RESOLUTION_TIMEOUT_SECONDS = 1800  # 30 minutes — Polymarket CLOB closure can lag 5-15 min after market end
+SWEEP_INTERVAL_SECONDS = 300       # 5 minutes between sweep passes
+SWEEP_MAX_AGE_SECONDS = 6 * 3600   # 6 hours — after this, give up permanently on unknown trades
+
 # Signal rules: each is (target_seconds, seconds_tolerance, min_ask, max_ask, label).
 # Target times and price buckets are validated by analysis PRs #6-8 on 33h of data.
 SIGNAL_RULES: list[tuple[float, float, float, float, str]] = [
@@ -130,6 +135,7 @@ class PaperTrader:
             self._refresh_loop(),
             self._resolution_loop(),
             self._flush_loop(),
+            self._sweep_loop(),
             self._heartbeat_loop(),
         )
 
@@ -368,11 +374,11 @@ class PaperTrader:
             trade.resolution_timestamp_utc = now
 
             if winner is None:
-                # Not yet resolved on API side; keep waiting up to 5 minutes past end
-                if secs_past_end < 300:
+                # Not yet resolved on API side; keep waiting up to 30 minutes past end
+                if secs_past_end < RESOLUTION_TIMEOUT_SECONDS:
                     still_open.append(trade)
                     continue
-                # Give up — mark as unknown
+                # Give up — mark as unknown (sweep loop will retry for 6 hours)
                 trade.winner = "unknown"
                 trade.payout_usdc = 0.0
                 trade.pnl_usdc = -trade.simulated_stake_usdc - trade.fee_usdc
@@ -428,6 +434,94 @@ class PaperTrader:
         # Market is closed but no winner flagged — shouldn't happen but log it
         logger.warning("Market %s is closed but no winner token found", condition_id)
         return None
+
+    # ------------------------------------------------------------------
+    # Sweep retry: recover late-resolved unknowns
+    # ------------------------------------------------------------------
+
+    async def _sweep_loop(self) -> None:
+        """Periodically re-check unknown trades; some markets resolve >5 min late."""
+        while self._running:
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+            await self._sweep_unknowns()
+
+    async def _sweep_unknowns(self) -> None:
+        """Walk today's CSV and re-resolve any row marked 'unknown' if not too old."""
+        today = datetime.now(UTC).strftime("%Y%m%d")
+        path = Path(config.DATA_DIR) / f"paper_trades_{today}.csv"
+        if not path.exists():
+            return
+
+        with path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            fieldnames = reader.fieldnames
+
+        if not rows or not fieldnames:
+            return
+
+        now = datetime.now(UTC)
+        fixed_count = 0
+
+        for row in rows:
+            if row["winner"] != "unknown":
+                continue
+
+            try:
+                entry_ts = datetime.fromisoformat(row["entry_timestamp_utc"])
+            except (ValueError, KeyError):
+                continue
+            age_seconds = (now - entry_ts).total_seconds()
+            if age_seconds > SWEEP_MAX_AGE_SECONDS:
+                continue
+
+            winner = await self._fetch_winner_from_api(row["condition_id"])
+            if winner is None:
+                continue
+
+            # Reverse the phantom-loss accounting
+            previous_pnl = float(row["pnl_usdc"])
+            self._total_pnl_usdc -= previous_pnl
+            self._total_losses -= 1
+
+            side = row["side"]
+            shares = float(row["simulated_shares"])
+            stake = float(row["simulated_stake_usdc"])
+            fee = float(row["fee_usdc"])
+
+            if side == winner:
+                payout = shares * 1.0
+                pnl = payout - stake - fee
+                self._total_wins += 1
+            else:
+                payout = 0.0
+                pnl = -stake - fee
+                self._total_losses += 1
+
+            self._total_pnl_usdc += pnl
+
+            row["winner"] = winner
+            row["payout_usdc"] = f"{payout:.4f}"
+            row["pnl_usdc"] = f"{pnl:.4f}"
+            row["resolution_timestamp_utc"] = now.isoformat(timespec="milliseconds")
+            fixed_count += 1
+
+            logger.info(
+                "BACKFILL %s: side=%s winner=%s pnl=%+.4f  trade_id=%s",
+                row["market_slug"], side, winner, pnl, row["trade_id"],
+            )
+
+        if fixed_count == 0:
+            return
+
+        # Atomic rewrite: write to .tmp then rename
+        tmp_path = path.with_suffix(".csv.tmp")
+        with tmp_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        tmp_path.replace(path)
+        logger.info("Sweep complete: fixed %d unknown trades", fixed_count)
 
     # ------------------------------------------------------------------
     # CSV flush
