@@ -3,7 +3,26 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_FEE_RATE = 0.02
+# Polymarket taker fee multipliers by market category.
+# Fee formula: fee_usdc = shares × CATEGORY_FEE_RATE[category] × price × (1 - price)
+# Peaks at price = 0.50, approaches zero at 0.01 and 0.99. Only takers pay.
+# Makers receive rebates (not modeled here — we assume taker execution).
+CATEGORY_FEE_RATES: dict[str, float] = {
+    "crypto": 0.072,
+    "economics": 0.05,
+    "culture": 0.05,
+    "weather": 0.05,
+    "finance": 0.04,
+    "politics": 0.04,
+    "tech": 0.04,
+    "sports": 0.03,
+    "geopolitics": 0.0,
+}
+
+# BTC / ETH 5-minute markets are Crypto category. This is our default since
+# the scanner only returns crypto markets.
+DEFAULT_CATEGORY = "crypto"
+DEFAULT_FEE_RATE = CATEGORY_FEE_RATES[DEFAULT_CATEGORY]
 
 import pandas as pd
 
@@ -30,6 +49,28 @@ class EntrySnapshot:
     mid: float
     seconds_to_resolution: float
     eventual_winner: str  # filled in after we know the outcome
+
+
+def compute_taker_fee(price: float, shares: float, fee_rate: float = DEFAULT_FEE_RATE) -> float:
+    """Compute Polymarket's taker fee in USDC for a trade.
+
+    Formula: fee = shares × fee_rate × price × (1 - price)
+
+    Fee is symmetric around 0.50 and approaches zero near 0.01 and 0.99.
+    Makers pay no fee (not modeled — assumes taker execution).
+
+    Args:
+        price: Trade price, 0.0 to 1.0.
+        shares: Number of shares traded.
+        fee_rate: Category multiplier (default: crypto rate 0.072).
+
+    Returns:
+        Fee in USDC, rounded to 5 decimal places. Minimum fee is 0.00001 USDC.
+    """
+    if price <= 0 or price >= 1:
+        return 0.0
+    fee = shares * fee_rate * price * (1 - price)
+    return max(round(fee, 5), 0.00001) if fee > 0 else 0.0
 
 
 def load_ticks(csv_paths: list[Path]) -> pd.DataFrame:
@@ -189,7 +230,8 @@ class BucketStats:
     win_rate: float         # wins / samples
     avg_entry_ask: float    # mean best_ask within this bucket
     naive_ev: float         # win_rate - avg_entry_ask
-    fee_adjusted_ev: float  # win_rate * (1 - fee_rate) - avg_entry_ask
+    fee_per_share: float    # fee_rate × avg_ask × (1 - avg_ask) — parabolic, peaks at 0.50
+    fee_adjusted_ev: float  # win_rate × (1 - fee_per_share) - avg_entry_ask
 
 
 def compute_win_rates_by_bucket(
@@ -222,6 +264,7 @@ def compute_win_rates_by_bucket(
                 win_rate=0.0,
                 avg_entry_ask=0.0,
                 naive_ev=0.0,
+                fee_per_share=0.0,
                 fee_adjusted_ev=0.0,
             ))
             continue
@@ -229,6 +272,7 @@ def compute_win_rates_by_bucket(
         wins = sum(1 for s in in_bucket if s.side == s.eventual_winner)
         avg_ask = sum(s.best_ask for s in in_bucket) / n
         win_rate = wins / n
+        fee_per_share = fee_rate * avg_ask * (1 - avg_ask)
         results.append(BucketStats(
             bucket_label=label,
             lower=lower,
@@ -238,7 +282,8 @@ def compute_win_rates_by_bucket(
             win_rate=win_rate,
             avg_entry_ask=avg_ask,
             naive_ev=win_rate - avg_ask,
-            fee_adjusted_ev=win_rate * (1 - fee_rate) - avg_ask,
+            fee_per_share=fee_per_share,
+            fee_adjusted_ev=win_rate * (1 - fee_per_share) - avg_ask,
         ))
 
     return results

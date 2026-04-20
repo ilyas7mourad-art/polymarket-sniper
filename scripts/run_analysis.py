@@ -39,17 +39,17 @@ TARGET_SECONDS: list[float] = [120.0, 60.0, 30.0, 10.0]
 
 
 def _bucket_table(stats: list[BucketStats]) -> str:
-    header = f"| bucket | N | wins | win rate | avg ask | EV (naive) | EV (fee={DEFAULT_FEE_RATE:.0%}) |"
-    sep = "|--------|---|------|----------|---------|------------|--------------|"
+    header = "| bucket | N | wins | win rate | avg ask | fee/share | EV (naive) | EV (real) |"
+    sep = "|--------|---|------|----------|---------|-----------|------------|-----------|"
     rows = [header, sep]
     for s in stats:
         if s.n_samples == 0:
             rows.append(
-                f"| {s.bucket_label} | 0 | 0 | — | {s.avg_entry_ask:.4f} | — | — |"
+                f"| {s.bucket_label} | 0 | 0 | — | {s.avg_entry_ask:.4f} | — | — | — |"
             )
         else:
             rows.append(
-                f"| {s.bucket_label} | {s.n_samples} | {s.n_wins} | {s.win_rate:.1%} | {s.avg_entry_ask:.4f} | {s.naive_ev:+.4f} | {s.fee_adjusted_ev:+.4f} |"
+                f"| {s.bucket_label} | {s.n_samples} | {s.n_wins} | {s.win_rate:.1%} | {s.avg_entry_ask:.4f} | {s.fee_per_share:.5f} | {s.naive_ev:+.4f} | {s.fee_adjusted_ev:+.4f} |"
             )
     return "\n".join(rows)
 
@@ -170,7 +170,7 @@ def main() -> None:
     emit(f"2. **Samples with best_ask ≥ 0.90:** {total_high_ask_samples} (across all target times)")
     emit()
 
-    emit(f"3. **Fee-adjusted EV per trade by bucket** (win_rate × (1 − {DEFAULT_FEE_RATE:.0%}) − avg_ask):")
+    emit("3. **Fee-adjusted EV per trade by bucket** (real Polymarket formula, crypto rate 0.072):")
     emit()
     for t in TARGET_SECONDS:
         stats = per_target.get(t, [])
@@ -180,8 +180,16 @@ def main() -> None:
         for s in stats:
             if s.n_samples == 0:
                 continue
-            emit(f"   - {s.bucket_label}: fee_adj_EV = {s.fee_adjusted_ev:+.4f}, naive_EV = {s.naive_ev:+.4f} (win_rate={s.win_rate:.1%}, avg_ask={s.avg_entry_ask:.4f}, N={s.n_samples})")
+            emit(f"   - {s.bucket_label}: fee_adj_EV = {s.fee_adjusted_ev:+.4f}, naive_EV = {s.naive_ev:+.4f}, fee/share = {s.fee_per_share:.5f} (win_rate={s.win_rate:.1%}, avg_ask={s.avg_entry_ask:.4f}, N={s.n_samples})")
         emit()
+
+    emit("---")
+    emit("## Fee assumption")
+    emit()
+    emit("Polymarket taker fee formula: fee_usdc = shares × fee_rate × price × (1 - price).")
+    emit(f"Crypto category fee_rate = {DEFAULT_FEE_RATE}. Fee peaks at price=0.50, approaches zero at 0.01 and 0.99.")
+    emit("Only takers pay; makers receive rebates (not modeled).")
+    emit()
 
     _write_report(data_dir, lines)
 
