@@ -1,7 +1,8 @@
 """Unit tests for src/paper_trader.py — all offline."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -119,34 +120,10 @@ def test_fire_entry_computes_fee_correctly() -> None:
     assert abs(trade.simulated_shares - 1.0 / 0.99) < 1e-6
 
 
-def test_determine_winner_when_up_high_down_low() -> None:
-    trader = PaperTrader()
-    market = _make_market()
-    trader._book_asks[market.up_token_id] = {0.98: 100.0}
-    trader._book_asks[market.down_token_id] = {0.02: 100.0}
-    assert trader._determine_winner_from_book(market) == "Up"
-
-
-def test_determine_winner_when_down_high_up_low() -> None:
-    trader = PaperTrader()
-    market = _make_market()
-    trader._book_asks[market.up_token_id] = {0.01: 100.0}
-    trader._book_asks[market.down_token_id] = {0.99: 100.0}
-    assert trader._determine_winner_from_book(market) == "Down"
-
-
-def test_determine_winner_unknown_when_mid_price() -> None:
-    trader = PaperTrader()
-    market = _make_market()
-    trader._book_asks[market.up_token_id] = {0.55: 100.0}
-    trader._book_asks[market.down_token_id] = {0.45: 100.0}
-    assert trader._determine_winner_from_book(market) == "unknown"
-
-
 def test_resolve_open_trades_marks_win_correctly() -> None:
     trader = PaperTrader()
-    market = _make_market(end_offset_s=-60.0)  # end_time = pinned_now - 60s
-    # Pass now = end_time + 120s so secs_past_end = 120 (> 30 threshold)
+    market = _make_market(end_offset_s=-60.0)
+    # Pass now = end_time + 120s so secs_past_end = 120 (> 30 threshold), clock-independent
     resolve_now = market.end_time + timedelta(seconds=120)
     trade = PaperTrade(
         trade_id="20260420_000001",
@@ -162,10 +139,10 @@ def test_resolve_open_trades_marks_win_correctly() -> None:
         fee_usdc=0.002,
     )
     trader._open_trades.append(trade)
-    # Up wins
-    trader._book_asks[market.up_token_id] = {0.99: 100.0}
-    trader._book_asks[market.down_token_id] = {0.01: 100.0}
-    trader._resolve_open_trades(now=resolve_now)
+
+    with patch.object(trader, "_fetch_winner_from_api", new_callable=AsyncMock) as mock_api:
+        mock_api.return_value = "Up"
+        asyncio.run(trader._resolve_open_trades(now=resolve_now))
 
     assert trader._total_wins == 1
     assert trader._total_losses == 0
@@ -192,13 +169,73 @@ def test_resolve_open_trades_marks_loss_correctly() -> None:
         fee_usdc=0.002,
     )
     trader._open_trades.append(trade)
-    # Down wins — Up side loses
-    trader._book_asks[market.up_token_id] = {0.01: 100.0}
-    trader._book_asks[market.down_token_id] = {0.99: 100.0}
-    trader._resolve_open_trades(now=resolve_now)
+
+    with patch.object(trader, "_fetch_winner_from_api", new_callable=AsyncMock) as mock_api:
+        mock_api.return_value = "Down"
+        asyncio.run(trader._resolve_open_trades(now=resolve_now))
 
     assert trader._total_losses == 1
     assert trader._total_wins == 0
     assert trade.winner == "Down"
     assert trade.payout_usdc == 0.0
+    assert trade.pnl_usdc is not None and trade.pnl_usdc < 0
+
+
+def test_resolve_open_trades_stays_open_when_api_returns_none() -> None:
+    """Market not yet resolved on API — trade stays open if within 5-minute timeout."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=-60.0)
+    # 60s past end is within the 300s timeout
+    resolve_now = market.end_time + timedelta(seconds=60)
+    trade = PaperTrade(
+        trade_id="20260420_000003",
+        entry_timestamp_utc=market.end_time - timedelta(seconds=10),
+        market=market,
+        side="Up",
+        signal_bucket_label="T=10s_0.95-1.00",
+        signal_target_time_s=10.0,
+        seconds_to_resolution_at_entry=10.0,
+        entry_price=0.97,
+        simulated_shares=1.0 / 0.97,
+        simulated_stake_usdc=1.0,
+        fee_usdc=0.002,
+    )
+    trader._open_trades.append(trade)
+
+    with patch.object(trader, "_fetch_winner_from_api", new_callable=AsyncMock) as mock_api:
+        mock_api.return_value = None  # API says not resolved yet
+        asyncio.run(trader._resolve_open_trades(now=resolve_now))
+
+    assert len(trader._open_trades) == 1  # still open
+    assert trader._total_wins == 0
+    assert trader._total_losses == 0
+
+
+def test_resolve_open_trades_times_out_as_unknown_after_5min() -> None:
+    """Market hasn't resolved on API after 5 minutes → mark unknown and give up."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=-360.0)
+    # 360s past end exceeds the 300s timeout
+    resolve_now = market.end_time + timedelta(seconds=360)
+    trade = PaperTrade(
+        trade_id="20260420_000004",
+        entry_timestamp_utc=market.end_time - timedelta(seconds=10),
+        market=market,
+        side="Up",
+        signal_bucket_label="T=10s_0.95-1.00",
+        signal_target_time_s=10.0,
+        seconds_to_resolution_at_entry=10.0,
+        entry_price=0.97,
+        simulated_shares=1.0 / 0.97,
+        simulated_stake_usdc=1.0,
+        fee_usdc=0.002,
+    )
+    trader._open_trades.append(trade)
+
+    with patch.object(trader, "_fetch_winner_from_api", new_callable=AsyncMock) as mock_api:
+        mock_api.return_value = None
+        asyncio.run(trader._resolve_open_trades(now=resolve_now))
+
+    assert len(trader._open_trades) == 0
+    assert trade.winner == "unknown"
     assert trade.pnl_usdc is not None and trade.pnl_usdc < 0

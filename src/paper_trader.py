@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import websockets
 
 from src.analysis import DEFAULT_FEE_RATE, compute_taker_fee
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 UTC = timezone.utc
 
 _WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+_CLOB_MARKETS_URL = "https://clob.polymarket.com/markets"
 
 # Simulated stake per trade (USDC). Chosen for clean math in logs.
 STAKE_USDC = 1.0
@@ -347,10 +349,10 @@ class PaperTrader:
         """Every 15s, check open trades whose markets have resolved."""
         while self._running:
             await asyncio.sleep(15)
-            self._resolve_open_trades()
+            await self._resolve_open_trades()
 
-    def _resolve_open_trades(self, now: Optional[datetime] = None) -> None:
-        """For open trades past end_time by at least 30s, determine winner and finalize."""
+    async def _resolve_open_trades(self, now: Optional[datetime] = None) -> None:
+        """For open trades past end_time by at least 30s, query API and finalize."""
         if now is None:
             now = datetime.now(UTC)
         still_open: list[PaperTrade] = []
@@ -361,20 +363,21 @@ class PaperTrader:
                 still_open.append(trade)
                 continue
 
-            # Determine winner from current book state
-            winner = self._determine_winner_from_book(trade.market)
+            # Query API for authoritative resolution
+            winner = await self._fetch_winner_from_api(trade.market.condition_id)
             trade.resolution_timestamp_utc = now
-            trade.winner = winner
 
-            if winner == "unknown":
-                # Can't finalize yet; keep waiting up to 5 minutes past end
+            if winner is None:
+                # Not yet resolved on API side; keep waiting up to 5 minutes past end
                 if secs_past_end < 300:
                     still_open.append(trade)
                     continue
-                # Give up and write with winner=unknown
+                # Give up — mark as unknown
+                trade.winner = "unknown"
                 trade.payout_usdc = 0.0
                 trade.pnl_usdc = -trade.simulated_stake_usdc - trade.fee_usdc
             else:
+                trade.winner = winner
                 if trade.side == winner:
                     trade.payout_usdc = trade.simulated_shares * 1.0
                     trade.pnl_usdc = trade.payout_usdc - trade.simulated_stake_usdc - trade.fee_usdc
@@ -389,43 +392,42 @@ class PaperTrader:
 
             logger.info(
                 "RESOLVED %s: side=%s winner=%s pnl=%+.4f  trade_id=%s",
-                trade.market.slug, trade.side, winner, trade.pnl_usdc, trade.trade_id,
+                trade.market.slug, trade.side, trade.winner, trade.pnl_usdc, trade.trade_id,
             )
 
         self._open_trades = still_open
 
-    def _determine_winner_from_book(self, market: Market) -> str:
-        """Inspect the current best_ask on each side to infer the winner.
+    async def _fetch_winner_from_api(self, condition_id: str) -> Optional[str]:
+        """Query Polymarket's CLOB API for authoritative market resolution.
 
-        At resolution, the winning side has best_ask near 1.0 (and best_bid near 1.0);
-        the losing side has best_ask near 0.0. If the book hasn't settled, returns "unknown".
+        Returns "Up", "Down", or None if the market is not yet resolved
+        (or if any error occurred during the request).
         """
-        up_ask = self._best_ask(market.up_token_id)
-        down_ask = self._best_ask(market.down_token_id)
+        url = f"{_CLOB_MARKETS_URL}/{condition_id}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            logger.warning("API winner lookup failed for %s: %s", condition_id, exc)
+            return None
 
-        up_bids = self._book_bids.get(market.up_token_id, {})
-        down_bids = self._book_bids.get(market.down_token_id, {})
-        up_best_bid = max((p for p, s in up_bids.items() if s > 0), default=None)
-        down_best_bid = max((p for p, s in down_bids.items() if s > 0), default=None)
+        # Market not yet resolved
+        if not data.get("closed", False):
+            return None
 
-        def side_state(ask: Optional[float], bid: Optional[float]) -> str:
-            val = ask if ask is not None else bid
-            if val is None:
-                return "unknown"
-            if val >= 0.95:
-                return "high"
-            if val <= 0.05:
-                return "low"
-            return "mid"
+        # Inspect tokens for the winner flag
+        tokens = data.get("tokens", [])
+        for token in tokens:
+            if token.get("winner") is True:
+                outcome = token.get("outcome")
+                if outcome in ("Up", "Down"):
+                    return outcome
 
-        up_state = side_state(up_ask, up_best_bid)
-        down_state = side_state(down_ask, down_best_bid)
-
-        if up_state == "high" and down_state == "low":
-            return "Up"
-        if down_state == "high" and up_state == "low":
-            return "Down"
-        return "unknown"
+        # Market is closed but no winner flagged — shouldn't happen but log it
+        logger.warning("Market %s is closed but no winner token found", condition_id)
+        return None
 
     # ------------------------------------------------------------------
     # CSV flush
