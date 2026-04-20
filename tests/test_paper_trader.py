@@ -1,6 +1,7 @@
 """Unit tests for src/paper_trader.py — all offline."""
 
 import asyncio
+import csv
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -211,12 +212,12 @@ def test_resolve_open_trades_stays_open_when_api_returns_none() -> None:
     assert trader._total_losses == 0
 
 
-def test_resolve_open_trades_times_out_as_unknown_after_5min() -> None:
-    """Market hasn't resolved on API after 5 minutes → mark unknown and give up."""
+def test_resolve_open_trades_times_out_as_unknown_after_30min() -> None:
+    """Market hasn't resolved on API after 30 minutes → mark unknown and give up."""
     trader = PaperTrader()
-    market = _make_market(end_offset_s=-360.0)
-    # 360s past end exceeds the 300s timeout
-    resolve_now = market.end_time + timedelta(seconds=360)
+    market = _make_market(end_offset_s=-2000.0)
+    # 2000s past end exceeds the 1800s (30-min) timeout
+    resolve_now = market.end_time + timedelta(seconds=2000)
     trade = PaperTrade(
         trade_id="20260420_000004",
         entry_timestamp_utc=market.end_time - timedelta(seconds=10),
@@ -239,3 +240,133 @@ def test_resolve_open_trades_times_out_as_unknown_after_5min() -> None:
     assert len(trader._open_trades) == 0
     assert trade.winner == "unknown"
     assert trade.pnl_usdc is not None and trade.pnl_usdc < 0
+
+
+# ---------------------------------------------------------------------------
+# Resolution timeout / sweep constants
+# ---------------------------------------------------------------------------
+
+
+def test_resolution_timeout_constant_is_30_min() -> None:
+    from src.paper_trader import RESOLUTION_TIMEOUT_SECONDS
+    assert RESOLUTION_TIMEOUT_SECONDS == 1800
+
+
+def test_sweep_constants() -> None:
+    from src.paper_trader import SWEEP_INTERVAL_SECONDS, SWEEP_MAX_AGE_SECONDS
+    assert SWEEP_INTERVAL_SECONDS == 300
+    assert SWEEP_MAX_AGE_SECONDS == 6 * 3600
+
+
+# ---------------------------------------------------------------------------
+# _sweep_unknowns — recovers late resolution
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_unknowns_recovers_late_resolution(tmp_path) -> None:
+    """Sweep finds an unknown row, queries API, and corrects it in the CSV."""
+    from src.paper_trader import PaperTrader, _CSV_HEADER
+
+    now = datetime.now(UTC)
+    entry_ts = now - timedelta(minutes=30)
+    csv_path = tmp_path / f"paper_trades_{now.strftime('%Y%m%d')}.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_CSV_HEADER)
+        writer.writerow([
+            "20260420_000001",
+            entry_ts.isoformat(timespec="milliseconds"),
+            "btc-updown-5m-test",
+            "BTC", "0xabc", "Down",
+            "T=10s_0.95-1.00", "10", "10.0",
+            "0.9500", "1.052632", "1.0000", "0.00360",
+            (entry_ts + timedelta(minutes=5)).isoformat(timespec="milliseconds"),
+            "unknown", "0.0000", "-1.0036",
+        ])
+
+    trader = PaperTrader()
+    # Simulate prior phantom-loss accounting
+    trader._total_losses = 1
+    trader._total_pnl_usdc = -1.0036
+
+    with patch("src.paper_trader.config") as mock_config, \
+         patch.object(trader, "_fetch_winner_from_api", new_callable=AsyncMock) as mock_api:
+        mock_config.DATA_DIR = str(tmp_path)
+        mock_api.return_value = "Down"  # Down wins — our Down bet is a win
+        asyncio.run(trader._sweep_unknowns())
+
+    with csv_path.open("r") as f:
+        rows = list(csv.DictReader(f))
+
+    assert rows[0]["winner"] == "Down"
+    assert float(rows[0]["payout_usdc"]) == pytest.approx(1.052632, abs=1e-4)
+    assert float(rows[0]["pnl_usdc"]) > 0
+
+    # Phantom loss removed, real win added
+    assert trader._total_wins == 1
+    assert trader._total_losses == 0
+    assert trader._total_pnl_usdc > 0
+
+
+def test_sweep_unknowns_skips_old_trades(tmp_path) -> None:
+    """Sweep ignores trades older than SWEEP_MAX_AGE_SECONDS."""
+    from src.paper_trader import PaperTrader, _CSV_HEADER, SWEEP_MAX_AGE_SECONDS
+
+    now = datetime.now(UTC)
+    # Entry from 7 hours ago — past the 6-hour cutoff
+    entry_ts = now - timedelta(seconds=SWEEP_MAX_AGE_SECONDS + 3600)
+    csv_path = tmp_path / f"paper_trades_{now.strftime('%Y%m%d')}.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_CSV_HEADER)
+        writer.writerow([
+            "20260420_000099",
+            entry_ts.isoformat(timespec="milliseconds"),
+            "btc-updown-5m-old",
+            "BTC", "0xold", "Up",
+            "T=10s_0.95-1.00", "10", "10.0",
+            "0.9500", "1.052632", "1.0000", "0.00360",
+            (entry_ts + timedelta(minutes=5)).isoformat(timespec="milliseconds"),
+            "unknown", "0.0000", "-1.0036",
+        ])
+
+    trader = PaperTrader()
+
+    with patch("src.paper_trader.config") as mock_config, \
+         patch.object(trader, "_fetch_winner_from_api", new_callable=AsyncMock) as mock_api:
+        mock_config.DATA_DIR = str(tmp_path)
+        mock_api.return_value = "Up"
+        asyncio.run(trader._sweep_unknowns())
+
+    mock_api.assert_not_called()
+
+
+def test_sweep_unknowns_skips_already_resolved(tmp_path) -> None:
+    """Sweep ignores rows where winner is already Up or Down."""
+    from src.paper_trader import PaperTrader, _CSV_HEADER
+
+    now = datetime.now(UTC)
+    entry_ts = now - timedelta(minutes=10)
+    csv_path = tmp_path / f"paper_trades_{now.strftime('%Y%m%d')}.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_CSV_HEADER)
+        writer.writerow([
+            "20260420_000050",
+            entry_ts.isoformat(timespec="milliseconds"),
+            "btc-updown-5m-resolved",
+            "BTC", "0xres", "Down",
+            "T=10s_0.95-1.00", "10", "10.0",
+            "0.9500", "1.052632", "1.0000", "0.00360",
+            (entry_ts + timedelta(minutes=5)).isoformat(timespec="milliseconds"),
+            "Down", "1.0526", "0.0490",
+        ])
+
+    trader = PaperTrader()
+
+    with patch("src.paper_trader.config") as mock_config, \
+         patch.object(trader, "_fetch_winner_from_api", new_callable=AsyncMock) as mock_api:
+        mock_config.DATA_DIR = str(tmp_path)
+        asyncio.run(trader._sweep_unknowns())
+
+    mock_api.assert_not_called()
