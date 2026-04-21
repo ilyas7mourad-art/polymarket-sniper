@@ -17,8 +17,11 @@ logger = logging.getLogger(__name__)
 
 UTC = timezone.utc
 
-# Bonereaper's proxy wallet (Gnosis Safe).
-BONEREAPER_PROXY = "0x3F9ffDC79719B8B47543461C197c2689FF5051b0"
+# Bonereaper's proxy wallet (Gnosis Safe). Identified via Polymarket username lookup:
+# GET https://data-api.polymarket.com/trades?user=bonereaper
+# proxyWallet in the response is 0x519e0202046caf341469df75b2e7a7eac4f3d41d.
+# The earlier wallet 0x3F9f... was a different trader (Obvious-Bear-Chef).
+BONEREAPER_PROXY = "0x519e0202046caf341469df75b2e7a7eac4f3d41d"
 
 # Polymarket's data API endpoint for trades by wallet.
 _TRADES_URL = "https://data-api.polymarket.com/trades"
@@ -62,12 +65,42 @@ class BonereaperTracker:
         for sig in (os_signal.SIGINT, os_signal.SIGTERM):
             loop.add_signal_handler(sig, self._shutdown)
 
+        # Sanity check: confirm the wallet we're tracking actually has recent trades
+        # and log the display name so identity mix-ups are obvious.
+        await self._log_identity_check()
+
         # On startup, prime _seen_tx from today's CSV so we don't re-log past trades
         self._prime_seen_from_csv()
 
         await asyncio.gather(
             self._poll_loop(),
             self._heartbeat_loop(),
+        )
+
+    async def _log_identity_check(self) -> None:
+        """Hit the API once at startup and log the wallet's display name + latest trade."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(_TRADES_URL, params={"user": self.wallet, "limit": 1})
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            logger.warning("Identity check failed: %s", exc)
+            return
+
+        if not isinstance(data, list) or not data:
+            logger.warning("Wallet %s has no trades — are you sure this is right?", self.wallet)
+            return
+
+        latest = data[0]
+        name = latest.get("name", "?")
+        pseudonym = latest.get("pseudonym", "?")
+        ts = latest.get("timestamp", 0)
+        from datetime import datetime as _dt
+        latest_iso = _dt.fromtimestamp(ts, tz=UTC).isoformat(timespec="seconds") if ts else "?"
+        logger.info(
+            "Tracking wallet %s (name=%s, pseudonym=%s), latest trade at %s",
+            self.wallet, name, pseudonym, latest_iso,
         )
 
     def _prime_seen_from_csv(self) -> None:

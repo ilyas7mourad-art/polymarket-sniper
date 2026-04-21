@@ -39,7 +39,7 @@ def _mock_trade(tx: str, price: float = 0.5, size: float = 10.0,
 
 
 def test_constants() -> None:
-    assert BONEREAPER_PROXY == "0x3F9ffDC79719B8B47543461C197c2689FF5051b0"
+    assert BONEREAPER_PROXY == "0x519e0202046caf341469df75b2e7a7eac4f3d41d"
     assert POLL_INTERVAL_SECONDS == 5
     assert TRADES_PER_POLL == 50
 
@@ -224,3 +224,19 @@ def test_fetch_new_trades_returns_oldest_first() -> None:
     assert len(result) == 3
     assert result[0]["transaction_hash"] == "0x_oldest"
     assert result[2]["transaction_hash"] == "0x_newest"
+
+
+def test_log_identity_check_handles_empty_response() -> None:
+    """If the API returns nothing, identity check logs a warning but doesn't crash."""
+    tracker = BonereaperTracker()
+    mock_client = AsyncMock()
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = []
+    mock_resp.raise_for_status = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_resp)
+
+    with patch("src.bonereaper_tracker.httpx.AsyncClient") as mock_client_class:
+        mock_client_class.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_class.return_value.__aexit__ = AsyncMock(return_value=False)
+        # Should not raise
+        asyncio.run(tracker._log_identity_check())
