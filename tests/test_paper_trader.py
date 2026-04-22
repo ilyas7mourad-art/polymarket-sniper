@@ -34,12 +34,13 @@ def _make_market(end_offset_s: float = 60.0, condition_id: str = "0xabc") -> Mar
     )
 
 
-def test_signal_rules_cover_three_verified_buckets() -> None:
-    assert len(SIGNAL_RULES) == 3
+def test_signal_rules_cover_four_buckets() -> None:
+    assert len(SIGNAL_RULES) == 4
     labels = [r[4] for r in SIGNAL_RULES]
     assert "T=60s_0.90-0.95" in labels
     assert "T=60s_0.95-1.00" in labels
     assert "T=10s_0.95-1.00" in labels
+    assert "T=270s_0.70-0.85" in labels
 
 
 def test_stake_usdc_is_one_dollar() -> None:
@@ -370,3 +371,53 @@ def test_sweep_unknowns_skips_already_resolved(tmp_path) -> None:
         asyncio.run(trader._sweep_unknowns())
 
     mock_api.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# T=270s bucket tests
+# ---------------------------------------------------------------------------
+
+
+def test_t270_bucket_fires_at_mid_price() -> None:
+    """At T-270s with best_ask=0.75, the T=270s_0.70-0.85 rule should fire."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=270.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.75: 100.0}
+
+    now = market.end_time - timedelta(seconds=270)
+    trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 1
+    trade = trader._open_trades[0]
+    assert trade.entry_price == 0.75
+    assert trade.signal_bucket_label == "T=270s_0.70-0.85"
+
+
+def test_t270_bucket_respects_tolerance_boundary() -> None:
+    """At T-241s (within 30s tolerance of 270s) the rule should fire."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=241.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.78: 100.0}
+
+    now = market.end_time - timedelta(seconds=241)
+    trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 1
+
+
+def test_t270_bucket_does_not_fire_outside_tolerance() -> None:
+    """At T-200s (outside 30s tolerance of 270s) the rule should NOT fire."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=200.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.78: 100.0}
+
+    now = market.end_time - timedelta(seconds=200)
+    trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 0

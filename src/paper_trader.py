@@ -34,11 +34,14 @@ SWEEP_INTERVAL_SECONDS = 300       # 5 minutes between sweep passes
 SWEEP_MAX_AGE_SECONDS = 6 * 3600   # 6 hours — after this, give up permanently on unknown trades
 
 # Signal rules: each is (target_seconds, seconds_tolerance, min_ask, max_ask, label).
-# Target times and price buckets are validated by analysis PRs #6-8 on 33h of data.
+# First three buckets are validated by analysis PRs #6-8 on 33h of observer data.
+# Fourth bucket (T=270s_0.70-0.85) is derived from Bonereaper's realized PnL analysis:
+# 85% win rate, +15% ROI on capital over 94 markets.
 SIGNAL_RULES: list[tuple[float, float, float, float, str]] = [
     (60.0, 5.0, 0.90, 0.95, "T=60s_0.90-0.95"),
     (60.0, 5.0, 0.95, 1.00, "T=60s_0.95-1.00"),
     (10.0, 5.0, 0.95, 1.00, "T=10s_0.95-1.00"),
+    (270.0, 30.0, 0.70, 0.85, "T=270s_0.70-0.85"),  # Bonereaper-inspired
 ]
 
 _CSV_HEADER = [
