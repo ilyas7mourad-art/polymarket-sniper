@@ -15,6 +15,7 @@ import httpx
 import websockets
 
 from src.analysis import DEFAULT_FEE_RATE, compute_taker_fee
+from src.binance_price_feed import BinancePriceFeed
 from src.config import config
 from src.scanner import Market, scan
 
@@ -114,12 +115,16 @@ class PaperTrader:
         self._running = False
         self._ws: Optional[websockets.WebSocketClientProtocol] = None  # type: ignore[type-arg]
 
+        # Binance spot price feed for directional momentum filter
+        self._price_feed = BinancePriceFeed()
+
         # Session stats
         self._total_entries = 0
         self._total_wins = 0
         self._total_losses = 0
         self._total_pnl_usdc = 0.0
         self._trade_id_counter = 0
+        self._binance_filtered_skips = 0
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -140,6 +145,7 @@ class PaperTrader:
             self._flush_loop(),
             self._sweep_loop(),
             self._heartbeat_loop(),
+            self._price_feed.run(),
         )
 
     # ------------------------------------------------------------------
@@ -304,6 +310,15 @@ class PaperTrader:
             in_time_window = abs(seconds_to_resolution - target_s) <= tol_s
             in_price_bucket = min_ask <= best_ask < max_ask
             if in_time_window and in_price_bucket:
+                if label == "T=270s_0.70-0.85":
+                    binance_dir = self._price_feed.get_direction(market.asset)
+                    if binance_dir is None or binance_dir != side:
+                        self._binance_filtered_skips += 1
+                        logger.debug(
+                            "Binance filter skipped %s %s (binance_dir=%s)",
+                            market.slug, side, binance_dir,
+                        )
+                        return
                 self._fire_entry(
                     market, side, best_ask, seconds_to_resolution,
                     target_s, label, now,
@@ -578,7 +593,8 @@ class PaperTrader:
             total_closed = self._total_wins + self._total_losses
             win_rate_str = f"{self._total_wins / total_closed * 100:.1f}%" if total_closed else "n/a"
             logger.info(
-                "Paper trader: %d markets, %d entries, %d open, %d wins, %d losses (%s), PnL=%+.4f USDC",
+                "Paper trader: %d markets, %d entries, %d open, %d wins, %d losses (%s), "
+                "PnL=%+.4f USDC, binance_skips=%d",
                 len(self._tracked),
                 self._total_entries,
                 len(self._open_trades),
@@ -586,6 +602,7 @@ class PaperTrader:
                 self._total_losses,
                 win_rate_str,
                 self._total_pnl_usdc,
+                self._binance_filtered_skips,
             )
 
     # ------------------------------------------------------------------
