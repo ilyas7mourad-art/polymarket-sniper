@@ -386,8 +386,9 @@ def test_t270_bucket_fires_at_mid_price() -> None:
     trader._token_to_market[market.up_token_id] = (market, "Up")
     trader._book_asks[market.up_token_id] = {0.75: 100.0}
 
-    now = market.end_time - timedelta(seconds=270)
-    trader._evaluate_signals(market.up_token_id, now)
+    with patch.object(trader._price_feed, "get_direction", return_value="Up"):
+        now = market.end_time - timedelta(seconds=270)
+        trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 1
     trade = trader._open_trades[0]
@@ -403,8 +404,9 @@ def test_t270_bucket_respects_tolerance_boundary() -> None:
     trader._token_to_market[market.up_token_id] = (market, "Up")
     trader._book_asks[market.up_token_id] = {0.78: 100.0}
 
-    now = market.end_time - timedelta(seconds=241)
-    trader._evaluate_signals(market.up_token_id, now)
+    with patch.object(trader._price_feed, "get_direction", return_value="Up"):
+        now = market.end_time - timedelta(seconds=241)
+        trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 1
 
@@ -421,3 +423,72 @@ def test_t270_bucket_does_not_fire_outside_tolerance() -> None:
     trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 0
+
+
+# ---------------------------------------------------------------------------
+# Binance momentum filter tests
+# ---------------------------------------------------------------------------
+
+
+def test_t270_fires_when_binance_direction_matches() -> None:
+    """T=270s entry fires when Binance direction agrees with the side."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=270.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.75: 100.0}
+
+    with patch.object(trader._price_feed, "get_direction", return_value="Up"):
+        now = market.end_time - timedelta(seconds=270)
+        trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 1
+    assert trader._binance_filtered_skips == 0
+
+
+def test_t270_skips_when_binance_direction_is_none() -> None:
+    """T=270s entry is skipped when Binance has no direction data."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=270.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.75: 100.0}
+
+    with patch.object(trader._price_feed, "get_direction", return_value=None):
+        now = market.end_time - timedelta(seconds=270)
+        trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 0
+    assert trader._binance_filtered_skips == 1
+
+
+def test_t270_skips_when_binance_direction_opposes_side() -> None:
+    """T=270s Up entry is skipped when Binance says Down."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=270.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.75: 100.0}
+
+    with patch.object(trader._price_feed, "get_direction", return_value="Down"):
+        now = market.end_time - timedelta(seconds=270)
+        trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 0
+    assert trader._binance_filtered_skips == 1
+
+
+def test_other_buckets_not_filtered_by_binance() -> None:
+    """Non-T=270s buckets fire regardless of Binance direction."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=60.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.97: 100.0}
+
+    with patch.object(trader._price_feed, "get_direction", return_value=None):
+        now = market.end_time - timedelta(seconds=60)
+        trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 1
+    assert trader._binance_filtered_skips == 0
