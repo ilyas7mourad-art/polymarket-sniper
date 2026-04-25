@@ -17,6 +17,7 @@ import websockets
 from src.analysis import DEFAULT_FEE_RATE, compute_taker_fee
 from src.binance_price_feed import BinancePriceFeed
 from src.config import config
+from src.realistic_executor import RealisticExecutor, SIMULATED_STAKES_USDC
 from src.scanner import Market, scan
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,11 @@ _CSV_HEADER = [
     "winner",
     "payout_usdc",
     "pnl_usdc",
+    # Realistic execution columns
+    "realistic_entry_price_1",
+    "realistic_entry_price_5",
+    "realistic_entry_price_25",
+    "realistic_out_of_bucket",
 ]
 
 
@@ -87,6 +93,12 @@ class PaperTrade:
     winner: Optional[str] = None  # "Up", "Down", or "unknown"
     payout_usdc: Optional[float] = None  # shares × $1 on win, $0 on loss
     pnl_usdc: Optional[float] = None  # payout - stake - fee
+
+    # Filled in by RealisticExecutor after simulated latency + book re-fetch
+    realistic_entry_price_1: Optional[float] = None
+    realistic_entry_price_5: Optional[float] = None
+    realistic_entry_price_25: Optional[float] = None
+    realistic_out_of_bucket: Optional[bool] = None
 
 
 class PaperTrader:
@@ -117,6 +129,9 @@ class PaperTrader:
 
         # Binance spot price feed for directional momentum filter
         self._price_feed = BinancePriceFeed()
+
+        # Realistic execution simulator
+        self._realistic_executor = RealisticExecutor()
 
         # Session stats
         self._total_entries = 0
@@ -365,6 +380,61 @@ class PaperTrader:
             seconds_to_resolution, label, trade_id,
         )
 
+        # Schedule realistic execution simulation (runs concurrently, fills trade fields).
+        # Guard against no running loop in sync test contexts — close coro to avoid warnings.
+        _coro = self._simulate_realistic_fill(trade, market, side)
+        try:
+            asyncio.create_task(_coro)
+        except RuntimeError:
+            _coro.close()
+
+    async def _simulate_realistic_fill(
+        self,
+        trade: PaperTrade,
+        market: Market,
+        side: str,
+    ) -> None:
+        """Run the realistic executor for this trade and store results on the trade object."""
+        token_id = market.up_token_id if side == "Up" else market.down_token_id
+
+        # Parse price range from label suffix, e.g. "T=270s_0.70-0.85" → (0.70, 0.85)
+        try:
+            price_part = trade.signal_bucket_label.split("_")[-1]
+            min_str, max_str = price_part.split("-")
+            signal_min_ask = float(min_str)
+            signal_max_ask = float(max_str)
+        except (ValueError, IndexError):
+            logger.warning(
+                "Could not parse bucket label %s for realistic fill", trade.signal_bucket_label
+            )
+            return
+
+        try:
+            fills = await self._realistic_executor.simulate_fill(
+                token_id=token_id,
+                signal_min_ask=signal_min_ask,
+                signal_max_ask=signal_max_ask,
+            )
+        except Exception as exc:
+            logger.warning("Realistic fill simulation failed: %s", exc)
+            return
+
+        trade.realistic_entry_price_1 = fills[1.0].weighted_avg_price if 1.0 in fills else None
+        trade.realistic_entry_price_5 = fills[5.0].weighted_avg_price if 5.0 in fills else None
+        trade.realistic_entry_price_25 = fills[25.0].weighted_avg_price if 25.0 in fills else None
+        trade.realistic_out_of_bucket = fills[1.0].out_of_bucket if 1.0 in fills else None
+
+        logger.info(
+            "REALISTIC %s: paper=%.4f, fills(1/5/25)=%s/%s/%s, out_of_bucket=%s, trade=%s",
+            market.slug,
+            trade.entry_price,
+            f"{trade.realistic_entry_price_1:.4f}" if trade.realistic_entry_price_1 is not None else "N/A",
+            f"{trade.realistic_entry_price_5:.4f}" if trade.realistic_entry_price_5 is not None else "N/A",
+            f"{trade.realistic_entry_price_25:.4f}" if trade.realistic_entry_price_25 is not None else "N/A",
+            trade.realistic_out_of_bucket,
+            trade.trade_id,
+        )
+
     # ------------------------------------------------------------------
     # Resolution matching
     # ------------------------------------------------------------------
@@ -579,6 +649,11 @@ class PaperTrader:
                     t.winner or "",
                     f"{t.payout_usdc:.4f}" if t.payout_usdc is not None else "",
                     f"{t.pnl_usdc:.4f}" if t.pnl_usdc is not None else "",
+                    # Realistic execution columns
+                    f"{t.realistic_entry_price_1:.4f}" if t.realistic_entry_price_1 is not None else "",
+                    f"{t.realistic_entry_price_5:.4f}" if t.realistic_entry_price_5 is not None else "",
+                    f"{t.realistic_entry_price_25:.4f}" if t.realistic_entry_price_25 is not None else "",
+                    str(t.realistic_out_of_bucket) if t.realistic_out_of_bucket is not None else "",
                 ])
         logger.debug("Flushed %d trades to %s", len(self._buffer), path)
         self._buffer.clear()
