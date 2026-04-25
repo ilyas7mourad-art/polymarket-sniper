@@ -12,6 +12,7 @@ from src.paper_trader import (
     PaperTrader,
     SIGNAL_RULES,
     STAKE_USDC,
+    _CSV_HEADER,
 )
 from src.scanner import Market
 
@@ -492,3 +493,38 @@ def test_other_buckets_not_filtered_by_binance() -> None:
 
     assert len(trader._open_trades) == 1
     assert trader._binance_filtered_skips == 0
+
+
+# ---------------------------------------------------------------------------
+# Realistic execution fields
+# ---------------------------------------------------------------------------
+
+
+def test_paper_trade_has_realistic_fields() -> None:
+    """PaperTrade dataclass exposes the four new realistic fields, defaulting to None."""
+    market = _make_market(end_offset_s=270.0)
+    trade = PaperTrade(
+        trade_id="test_id",
+        entry_timestamp_utc=datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC),
+        market=market,
+        side="Up",
+        signal_bucket_label="T=270s_0.70-0.85",
+        signal_target_time_s=270.0,
+        seconds_to_resolution_at_entry=270.0,
+        entry_price=0.75,
+        simulated_shares=1.0 / 0.75,
+        simulated_stake_usdc=1.0,
+        fee_usdc=0.005,
+    )
+    assert trade.realistic_entry_price_1 is None
+    assert trade.realistic_entry_price_5 is None
+    assert trade.realistic_entry_price_25 is None
+    assert trade.realistic_out_of_bucket is None
+
+
+def test_csv_header_includes_realistic_columns() -> None:
+    """_CSV_HEADER contains all four realistic execution columns."""
+    assert "realistic_entry_price_1" in _CSV_HEADER
+    assert "realistic_entry_price_5" in _CSV_HEADER
+    assert "realistic_entry_price_25" in _CSV_HEADER
+    assert "realistic_out_of_bucket" in _CSV_HEADER
