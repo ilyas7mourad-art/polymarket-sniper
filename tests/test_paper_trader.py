@@ -531,10 +531,16 @@ def test_csv_header_includes_realistic_columns() -> None:
     assert "realistic_out_of_bucket" in _CSV_HEADER
 
 
-def test_size_shares_rounded_to_4_decimals_in_live_mode() -> None:
-    """Live order size_shares must be ≤ 4 decimal places (Polymarket precision)."""
+def test_size_shares_satisfies_polymarket_decimal_constraints() -> None:
+    """Live amounts must satisfy Polymarket's 2-decimal maker and 4-decimal taker rules."""
+    from src.live_executor import compute_clean_order_amounts
     stake = 5.0
     best_ask = 0.70
-    size_shares = round(stake / best_ask, 4)
-    assert size_shares == 7.1429
-    assert len(str(size_shares).split(".")[-1]) <= 4
+    size_shares, notional = compute_clean_order_amounts(stake, best_ask)
+    # Taker (shares) ≤ 4 decimal places
+    assert round(size_shares, 4) == size_shares
+    # Maker (USDC) ≤ 2 decimal places
+    assert abs(size_shares * best_ask - round(size_shares * best_ask, 2)) < 1e-9
+    # Should be close to but not exceed stake
+    assert notional <= stake + 0.01
+    assert notional >= stake * 0.90
