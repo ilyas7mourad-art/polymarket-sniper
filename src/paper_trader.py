@@ -17,7 +17,7 @@ import websockets
 from src.analysis import DEFAULT_FEE_RATE, compute_taker_fee
 from src.binance_price_feed import BinancePriceFeed
 from src.config import config
-from src.live_executor import LiveExecutor
+from src.live_executor import LiveExecutor, compute_clean_order_amounts
 from src.realistic_executor import RealisticExecutor, SIMULATED_STAKES_USDC
 from src.safety import SafetyChecker
 from src.scanner import Market, scan
@@ -437,8 +437,13 @@ class PaperTrader:
                 trade.live_fill_status = f"blocked:{reason}"
             else:
                 token_id = market.up_token_id if side == "Up" else market.down_token_id
-                # Polymarket rejects orders where shares > 4 decimal places.
-                size_shares = round(config.LIVE_STAKE_USDC / best_ask, 4)
+                size_shares, actual_notional = compute_clean_order_amounts(
+                    config.LIVE_STAKE_USDC, best_ask
+                )
+                logger.debug(
+                    "Clean amounts: %.4f shares × $%.4f = $%.2f notional",
+                    size_shares, best_ask, actual_notional,
+                )
                 _live_coro = self._place_live_order(trade, token_id, best_ask, size_shares)
                 try:
                     asyncio.create_task(_live_coro)

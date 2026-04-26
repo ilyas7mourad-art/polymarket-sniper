@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -17,6 +18,40 @@ from py_clob_client.clob_types import (
 from src.config import config
 
 logger = logging.getLogger(__name__)
+
+
+def compute_clean_order_amounts(stake_usdc: float, price: float) -> tuple[float, float]:
+    """Return (size_shares, actual_notional) satisfying Polymarket's decimal constraints.
+
+    Polymarket requires:
+      - shares (taker amount) ≤ 4 decimal places
+      - shares × price (maker USDC) ≤ 2 decimal places
+
+    Uses integer arithmetic to find the largest share count satisfying both
+    constraints simultaneously. For shares = s/10000 and price = p/100,
+    the product s*p/1000000 is 2-decimal iff s*p is divisible by 10000,
+    i.e. s is a multiple of 10000/gcd(p, 10000).
+
+    Returns:
+        (size_shares, actual_notional_usdc). actual_notional may be slightly
+        less than stake_usdc due to rounding.
+    """
+    p = round(price * 100)              # price in integer cents (0.70 → 70)
+    stake_cents = round(stake_usdc * 100)  # stake in integer cents (5.0 → 500)
+
+    # s must be a multiple of this step to keep s*p divisible by 10000
+    step = 10000 // math.gcd(p, 10000)
+
+    # Largest s such that s/10000 * p/100 ≤ stake → s*p ≤ stake_cents * 10000
+    max_s = (stake_cents * 10000) // p
+    s = (max_s // step) * step
+
+    if s <= 0:
+        return (round(stake_usdc / price, 4), round(stake_usdc, 2))
+
+    size_shares = s / 10000
+    actual_notional = round(size_shares * price, 2)
+    return (size_shares, actual_notional)
 
 
 @dataclass

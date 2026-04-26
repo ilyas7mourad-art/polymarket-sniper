@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.live_executor import LiveExecutor, LiveOrderResult
+from src.live_executor import LiveExecutor, LiveOrderResult, compute_clean_order_amounts
 
 
 def _make_executor() -> LiveExecutor:
@@ -192,3 +192,32 @@ def test_order_result_dataclass() -> None:
     )
     assert r.error_message is None
     assert r.filled_shares == 0.0
+
+
+def test_compute_clean_order_amounts_basic() -> None:
+    """$5 stake at 0.70: shares ≤ 4 decimals AND shares×price ≤ 2 decimals."""
+    shares, notional = compute_clean_order_amounts(5.0, 0.70)
+    assert round(shares, 4) == shares
+    expected_notional = round(shares * 0.70, 2)
+    assert abs(shares * 0.70 - expected_notional) < 1e-9
+    assert notional == expected_notional
+
+
+def test_compute_clean_order_amounts_various_prices() -> None:
+    """Both constraints satisfied across all prices in our trading range."""
+    for price in [0.70, 0.75, 0.78, 0.85, 0.95, 0.97, 0.99]:
+        shares, notional = compute_clean_order_amounts(5.0, price)
+        assert round(shares, 4) == shares, f"shares not 4-decimal at price {price}"
+        product = shares * price
+        assert abs(product - round(product, 2)) < 1e-9, f"notional not 2-decimal at price {price}"
+        assert notional <= 5.01, f"notional ${notional:.4f} exceeds stake at price {price}"
+        assert notional >= 4.50, f"notional ${notional:.4f} too low at price {price}"
+
+
+def test_compute_clean_order_amounts_no_decimal_overflow() -> None:
+    """Specifically test the failing production case: $5 / 0.70 must not overflow to 3 decimals."""
+    shares, notional = compute_clean_order_amounts(5.0, 0.70)
+    product = shares * 0.70
+    cents = round(product * 100)
+    reconstructed = cents / 100.0
+    assert abs(product - reconstructed) < 1e-9, f"Product {product} has fractional cents"
