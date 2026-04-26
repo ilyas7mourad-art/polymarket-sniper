@@ -8,6 +8,8 @@ from typing import Optional
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
     OrderArgs,
     OrderType,
 )
@@ -164,8 +166,11 @@ class LiveExecutor:
     async def get_balance(self) -> float:
         """Return USDC balance of the wallet as a float."""
         await self._ensure_api_creds()
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         try:
-            balance_resp = await asyncio.to_thread(self._client.get_balance_allowance)
+            balance_resp = await asyncio.to_thread(
+                self._client.get_balance_allowance, params
+            )
         except Exception as exc:
             logger.warning("Balance fetch failed: %s", exc)
             return 0.0
