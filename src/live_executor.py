@@ -163,6 +163,7 @@ class LiveExecutor:
 
     async def get_balance(self) -> float:
         """Return USDC balance of the wallet as a float."""
+        await self._ensure_api_creds()
         try:
             balance_resp = await asyncio.to_thread(self._client.get_balance_allowance)
         except Exception as exc:
