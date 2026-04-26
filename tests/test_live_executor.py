@@ -141,6 +141,31 @@ def test_get_balance_failure() -> None:
     assert balance == 0.0
 
 
+@patch("src.live_executor.ClobClient")
+def test_get_balance_initializes_creds(mock_clob_class) -> None:
+    """get_balance should call _ensure_api_creds before fetching balance."""
+    mock_client = MagicMock()
+    mock_client.get_balance_allowance = MagicMock(return_value={"balance": "5000000"})
+    mock_client.derive_api_key = MagicMock(return_value=MagicMock())
+    mock_clob_class.return_value = mock_client
+
+    with patch("src.live_executor.config") as mock_config:
+        mock_config.WALLET_PRIVATE_KEY = "k"
+        mock_config.WALLET_FUNDER = "f"
+        mock_config.WALLET_ADDRESS = "a"
+        mock_config.CHAIN_ID = 137
+        mock_config.CLOB_HOST = "h"
+
+        executor = LiveExecutor()
+        assert executor._api_creds is None
+
+        balance = asyncio.run(executor.get_balance())
+
+        assert executor._api_creds is not None
+        assert balance == pytest.approx(5.0)
+        mock_client.derive_api_key.assert_called_once()
+
+
 def test_order_result_dataclass() -> None:
     """LiveOrderResult fields are accessible and optional fields default to None."""
     r = LiveOrderResult(
