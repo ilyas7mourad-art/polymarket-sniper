@@ -17,7 +17,9 @@ import websockets
 from src.analysis import DEFAULT_FEE_RATE, compute_taker_fee
 from src.binance_price_feed import BinancePriceFeed
 from src.config import config
+from src.live_executor import LiveExecutor
 from src.realistic_executor import RealisticExecutor, SIMULATED_STAKES_USDC
+from src.safety import SafetyChecker
 from src.scanner import Market, scan
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,12 @@ _CSV_HEADER = [
     "realistic_entry_price_5",
     "realistic_entry_price_25",
     "realistic_out_of_bucket",
+    # Live execution columns
+    "live_order_id",
+    "live_fill_status",
+    "live_fill_price",
+    "live_filled_shares",
+    "live_pnl_usdc",
 ]
 
 
@@ -98,6 +106,13 @@ class PaperTrade:
     realistic_entry_price_5: Optional[float] = None
     realistic_entry_price_25: Optional[float] = None
     realistic_out_of_bucket: Optional[bool] = None
+
+    # Filled in by LiveExecutor if LIVE_TRADING=True
+    live_order_id: Optional[str] = None
+    live_fill_status: Optional[str] = None
+    live_fill_price: Optional[float] = None
+    live_filled_shares: Optional[float] = None
+    live_pnl_usdc: Optional[float] = None
 
 
 class PaperTrader:
@@ -132,6 +147,26 @@ class PaperTrader:
         # Realistic execution simulator
         self._realistic_executor = RealisticExecutor()
 
+        # Live trading components
+        self._live_executor: Optional[LiveExecutor] = None
+        self._safety_checker = SafetyChecker()
+        self._cached_balance: float = 0.0
+        self._balance_last_check: Optional[datetime] = None
+
+        if config.LIVE_TRADING:
+            if not config.WALLET_PRIVATE_KEY:
+                raise RuntimeError("LIVE_TRADING=True but WALLET_PRIVATE_KEY not set in env")
+            if not config.WALLET_ADDRESS or not config.WALLET_FUNDER:
+                raise RuntimeError("LIVE_TRADING=True requires WALLET_ADDRESS and WALLET_FUNDER")
+            self._live_executor = LiveExecutor()
+            logger.info(
+                "LIVE TRADING ENABLED — wallet=%s, funder=%s, stake=$%.2f, daily_loss_limit=$%.2f",
+                config.WALLET_ADDRESS, config.WALLET_FUNDER,
+                config.LIVE_STAKE_USDC, config.LIVE_DAILY_LOSS_LIMIT_USDC,
+            )
+        else:
+            logger.info("PAPER MODE (LIVE_TRADING=False)")
+
         # Session stats
         self._total_entries = 0
         self._total_wins = 0
@@ -160,6 +195,7 @@ class PaperTrader:
             self._sweep_loop(),
             self._heartbeat_loop(),
             self._price_feed.run(),
+            self._balance_check_loop(),
         )
 
     # ------------------------------------------------------------------
@@ -387,6 +423,28 @@ class PaperTrader:
         except RuntimeError:
             _coro.close()
 
+        # Live order placement (only when LIVE_TRADING=True)
+        if config.LIVE_TRADING and self._live_executor is not None:
+            allowed, reason = self._safety_checker.can_place_order(
+                balance_usdc=self._cached_balance,
+                open_positions=len(self._open_trades),
+            )
+            if not allowed:
+                logger.warning(
+                    "Live order BLOCKED for %s %s: %s",
+                    market.slug, side, reason,
+                )
+                trade.live_fill_status = f"blocked:{reason}"
+            else:
+                token_id = market.up_token_id if side == "Up" else market.down_token_id
+                size_shares = config.LIVE_STAKE_USDC / best_ask
+                _live_coro = self._place_live_order(trade, token_id, best_ask, size_shares)
+                try:
+                    asyncio.create_task(_live_coro)
+                except RuntimeError:
+                    _live_coro.close()
+                self._safety_checker.record_order()
+
     async def _simulate_realistic_fill(
         self,
         trade: PaperTrade,
@@ -433,6 +491,63 @@ class PaperTrader:
             trade.realistic_out_of_bucket,
             trade.trade_id,
         )
+
+    async def _place_live_order(
+        self,
+        trade: PaperTrade,
+        token_id: str,
+        price: float,
+        size_shares: float,
+    ) -> None:
+        """Place a real Polymarket FAK order and store the result on the trade."""
+        if self._live_executor is None:
+            return
+
+        try:
+            result = await self._live_executor.place_order(
+                token_id=token_id,
+                price=price,
+                size_shares=size_shares,
+                side="BUY",
+            )
+        except Exception as exc:
+            logger.warning("Live order task failed: %s", exc)
+            trade.live_fill_status = f"task_error:{exc}"
+            return
+
+        trade.live_order_id = result.order_id
+        trade.live_fill_status = result.fill_status
+        trade.live_fill_price = result.avg_fill_price
+        trade.live_filled_shares = result.filled_shares
+
+        logger.info(
+            "LIVE %s: status=%s, fill=%s, shares=%.2f, order_id=%s",
+            trade.market.slug,
+            result.fill_status,
+            f"{result.avg_fill_price:.4f}" if result.avg_fill_price else "N/A",
+            result.filled_shares,
+            result.order_id,
+        )
+
+    async def _balance_check_loop(self) -> None:
+        """Periodically refresh the cached wallet balance (no-op in paper mode)."""
+        if not config.LIVE_TRADING or self._live_executor is None:
+            return
+
+        try:
+            self._cached_balance = await self._live_executor.get_balance()
+            self._balance_last_check = datetime.now(UTC)
+            logger.info("Initial wallet balance: $%.4f USDC", self._cached_balance)
+        except Exception as exc:
+            logger.warning("Initial balance fetch failed: %s", exc)
+
+        while self._running:
+            await asyncio.sleep(60)
+            try:
+                self._cached_balance = await self._live_executor.get_balance()
+                self._balance_last_check = datetime.now(UTC)
+            except Exception as exc:
+                logger.warning("Balance check failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Resolution matching
@@ -481,6 +596,21 @@ class PaperTrader:
                     self._total_losses += 1
 
             self._total_pnl_usdc += trade.pnl_usdc
+
+            # Compute live PnL if a real order was filled and market resolved
+            if (
+                config.LIVE_TRADING
+                and trade.live_filled_shares
+                and trade.live_fill_price
+                and trade.winner != "unknown"
+            ):
+                cost = trade.live_filled_shares * trade.live_fill_price
+                fee = trade.live_filled_shares * 0.072 * trade.live_fill_price * (1 - trade.live_fill_price)
+                if trade.winner == trade.side:
+                    trade.live_pnl_usdc = trade.live_filled_shares - cost - fee
+                else:
+                    trade.live_pnl_usdc = -cost - fee
+
             self._buffer.append(trade)
 
             logger.info(
@@ -653,6 +783,12 @@ class PaperTrader:
                     f"{t.realistic_entry_price_5:.4f}" if t.realistic_entry_price_5 is not None else "",
                     f"{t.realistic_entry_price_25:.4f}" if t.realistic_entry_price_25 is not None else "",
                     str(t.realistic_out_of_bucket) if t.realistic_out_of_bucket is not None else "",
+                    # Live execution columns
+                    t.live_order_id or "",
+                    t.live_fill_status or "",
+                    f"{t.live_fill_price:.4f}" if t.live_fill_price is not None else "",
+                    f"{t.live_filled_shares:.4f}" if t.live_filled_shares is not None else "",
+                    f"{t.live_pnl_usdc:.4f}" if t.live_pnl_usdc is not None else "",
                 ])
         logger.debug("Flushed %d trades to %s", len(self._buffer), path)
         self._buffer.clear()
