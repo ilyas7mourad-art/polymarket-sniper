@@ -529,3 +529,12 @@ def test_csv_header_includes_realistic_columns() -> None:
     assert "realistic_entry_price_5" in _CSV_HEADER
     assert "realistic_entry_price_25" in _CSV_HEADER
     assert "realistic_out_of_bucket" in _CSV_HEADER
+
+
+def test_size_shares_rounded_to_4_decimals_in_live_mode() -> None:
+    """Live order size_shares must be ≤ 4 decimal places (Polymarket precision)."""
+    stake = 5.0
+    best_ask = 0.70
+    size_shares = round(stake / best_ask, 4)
+    assert size_shares == 7.1429
+    assert len(str(size_shares).split(".")[-1]) <= 4

@@ -437,7 +437,8 @@ class PaperTrader:
                 trade.live_fill_status = f"blocked:{reason}"
             else:
                 token_id = market.up_token_id if side == "Up" else market.down_token_id
-                size_shares = config.LIVE_STAKE_USDC / best_ask
+                # Polymarket rejects orders where shares > 4 decimal places.
+                size_shares = round(config.LIVE_STAKE_USDC / best_ask, 4)
                 _live_coro = self._place_live_order(trade, token_id, best_ask, size_shares)
                 try:
                     asyncio.create_task(_live_coro)
