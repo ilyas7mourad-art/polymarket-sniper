@@ -35,13 +35,14 @@ def _make_market(end_offset_s: float = 60.0, condition_id: str = "0xabc") -> Mar
     )
 
 
-def test_signal_rules_cover_four_buckets() -> None:
-    assert len(SIGNAL_RULES) == 4
+def test_signal_rules_cover_two_validated_buckets() -> None:
+    assert len(SIGNAL_RULES) == 2
     labels = [r[4] for r in SIGNAL_RULES]
-    assert "T=60s_0.90-0.95" in labels
     assert "T=60s_0.95-1.00" in labels
-    assert "T=10s_0.95-1.00" in labels
     assert "T=270s_0.70-0.85" in labels
+    # These were dropped (negative realistic EV)
+    assert "T=10s_0.95-1.00" not in labels
+    assert "T=60s_0.90-0.95" not in labels
 
 
 def test_stake_usdc_is_one_dollar() -> None:
@@ -107,12 +108,12 @@ def test_evaluate_signals_no_fire_outside_price_bucket() -> None:
 
 def test_fire_entry_computes_fee_correctly() -> None:
     trader = PaperTrader()
-    market = _make_market(end_offset_s=10.0)
+    market = _make_market(end_offset_s=60.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
     trader._book_asks[market.up_token_id] = {0.99: 100.0}
 
-    now = market.end_time - timedelta(seconds=10)
+    now = market.end_time - timedelta(seconds=60)
     trader._evaluate_signals(market.up_token_id, now)
 
     trade = trader._open_trades[0]
@@ -130,12 +131,12 @@ def test_resolve_open_trades_marks_win_correctly() -> None:
     resolve_now = market.end_time + timedelta(seconds=120)
     trade = PaperTrade(
         trade_id="20260420_000001",
-        entry_timestamp_utc=market.end_time - timedelta(seconds=10),
+        entry_timestamp_utc=market.end_time - timedelta(seconds=60),
         market=market,
         side="Up",
-        signal_bucket_label="T=10s_0.95-1.00",
-        signal_target_time_s=10.0,
-        seconds_to_resolution_at_entry=10.0,
+        signal_bucket_label="T=60s_0.95-1.00",
+        signal_target_time_s=60.0,
+        seconds_to_resolution_at_entry=60.0,
         entry_price=0.97,
         simulated_shares=1.0 / 0.97,
         simulated_stake_usdc=1.0,
@@ -160,12 +161,12 @@ def test_resolve_open_trades_marks_loss_correctly() -> None:
     resolve_now = market.end_time + timedelta(seconds=120)
     trade = PaperTrade(
         trade_id="20260420_000002",
-        entry_timestamp_utc=market.end_time - timedelta(seconds=10),
+        entry_timestamp_utc=market.end_time - timedelta(seconds=60),
         market=market,
         side="Up",
-        signal_bucket_label="T=10s_0.95-1.00",
-        signal_target_time_s=10.0,
-        seconds_to_resolution_at_entry=10.0,
+        signal_bucket_label="T=60s_0.95-1.00",
+        signal_target_time_s=60.0,
+        seconds_to_resolution_at_entry=60.0,
         entry_price=0.97,
         simulated_shares=1.0 / 0.97,
         simulated_stake_usdc=1.0,
@@ -192,12 +193,12 @@ def test_resolve_open_trades_stays_open_when_api_returns_none() -> None:
     resolve_now = market.end_time + timedelta(seconds=60)
     trade = PaperTrade(
         trade_id="20260420_000003",
-        entry_timestamp_utc=market.end_time - timedelta(seconds=10),
+        entry_timestamp_utc=market.end_time - timedelta(seconds=60),
         market=market,
         side="Up",
-        signal_bucket_label="T=10s_0.95-1.00",
-        signal_target_time_s=10.0,
-        seconds_to_resolution_at_entry=10.0,
+        signal_bucket_label="T=60s_0.95-1.00",
+        signal_target_time_s=60.0,
+        seconds_to_resolution_at_entry=60.0,
         entry_price=0.97,
         simulated_shares=1.0 / 0.97,
         simulated_stake_usdc=1.0,
@@ -222,12 +223,12 @@ def test_resolve_open_trades_times_out_as_unknown_after_30min() -> None:
     resolve_now = market.end_time + timedelta(seconds=2000)
     trade = PaperTrade(
         trade_id="20260420_000004",
-        entry_timestamp_utc=market.end_time - timedelta(seconds=10),
+        entry_timestamp_utc=market.end_time - timedelta(seconds=60),
         market=market,
         side="Up",
-        signal_bucket_label="T=10s_0.95-1.00",
-        signal_target_time_s=10.0,
-        seconds_to_resolution_at_entry=10.0,
+        signal_bucket_label="T=60s_0.95-1.00",
+        signal_target_time_s=60.0,
+        seconds_to_resolution_at_entry=60.0,
         entry_price=0.97,
         simulated_shares=1.0 / 0.97,
         simulated_stake_usdc=1.0,
