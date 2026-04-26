@@ -121,14 +121,30 @@ def test_place_order_uses_taking_amount_fallback() -> None:
     assert result.filled_shares == pytest.approx(5.0, abs=0.01)
 
 
-def test_get_balance_success() -> None:
-    """Raw balance in microunits is divided by 1e6."""
-    executor = _make_executor()
-    executor._client.get_balance_allowance = MagicMock(return_value={"balance": "50000000"})
+@patch("src.live_executor.ClobClient")
+def test_get_balance_returns_float(mock_clob_class) -> None:
+    """Balance returned as USDC float; BalanceAllowanceParams passed to SDK."""
+    mock_client = MagicMock()
+    mock_client.get_balance_allowance = MagicMock(return_value={"balance": "10000000"})
+    mock_client.derive_api_key = MagicMock(return_value=MagicMock())
+    mock_clob_class.return_value = mock_client
 
-    balance = asyncio.run(executor.get_balance())
+    with patch("src.live_executor.config") as mock_config:
+        mock_config.WALLET_PRIVATE_KEY = "k"
+        mock_config.WALLET_FUNDER = "f"
+        mock_config.WALLET_ADDRESS = "a"
+        mock_config.CHAIN_ID = 137
+        mock_config.CLOB_HOST = "h"
 
-    assert balance == pytest.approx(50.0)
+        executor = LiveExecutor()
+        balance = asyncio.run(executor.get_balance())
+
+        assert balance == pytest.approx(10.0)
+        args, kwargs = mock_client.get_balance_allowance.call_args
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        assert len(args) == 1
+        assert isinstance(args[0], BalanceAllowanceParams)
+        assert args[0].asset_type == AssetType.COLLATERAL
 
 
 def test_get_balance_failure() -> None:
