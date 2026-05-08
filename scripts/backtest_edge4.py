@@ -2,8 +2,10 @@
 Offline backtest — Edge 4: Momentum within epoch.
 
 Signal rule: first orderbook snapshot per (condition_id, side) where
-    55 <= seconds_to_resolution <= 185  (targeting the 60-180s window)
+    90 <= seconds_to_resolution <= 110  (sweet-spot TTL window)
     mid >= 0.70
+    asset == BTC  (ETH edge is thin; BTC generates 79% of PnL)
+    UTC hour NOT in {7, 9, 14}  (consistent losers in baseline run)
 
 Entry price: best_ask at that snapshot.
 Exit: resolution — payout $1/share on win, $0 on loss.
@@ -28,8 +30,10 @@ DATA = "/home/mma/polymarket-sniper/data"
 STAKE_USDC = 1.0
 FEE_RATE = 0.02
 MID_THRESHOLD = 0.70
-TTL_MIN = 55
-TTL_MAX = 185
+TTL_MIN = 90
+TTL_MAX = 110
+ASSETS = {"BTC"}               # BTC-only; ETH edge is thin after fees
+SKIP_HOURS = {7, 9, 14}        # UTC hours that were net-negative in baseline
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,7 +134,15 @@ entries = (
     .drop_duplicates(subset=["condition_id", "side"], keep="first")
     .copy()
 )
-print(f"Unique (condition_id, side) entries: {len(entries):,}")
+
+# BTC-only filter
+entries = entries[entries["asset"].isin(ASSETS)]
+
+# Time-of-day filter: drop UTC hours that were net-negative in baseline
+entries["hour"] = entries["timestamp_utc"].dt.hour
+entries = entries[~entries["hour"].isin(SKIP_HOURS)]
+
+print(f"Unique (condition_id, side) entries after filters: {len(entries):,}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,7 +181,8 @@ cum = known["pnl"].cumsum()
 max_dd = (cum - cum.cummax()).min()
 
 print(f"\n{'='*60}")
-print(f"  BACKTEST RESULTS — Edge 4 Momentum (mid≥{MID_THRESHOLD:.0%}, TTL {TTL_MIN}-{TTL_MAX}s)")
+print(f"  BACKTEST RESULTS — Edge 4 Momentum (mid≥{MID_THRESHOLD:.0%}, TTL {TTL_MIN}-{TTL_MAX}s, "
+      f"assets={sorted(ASSETS)}, skip_hours={sorted(SKIP_HOURS)})")
 print(f"{'='*60}")
 print(f"  Trades       : {n}")
 print(f"  Win rate     : {wr:.1%}")
@@ -229,10 +242,15 @@ for window, g in known.groupby("window"):
 print()
 
 print("--- By TTL at entry ---")
+_ttl_step = max(5, (TTL_MAX - TTL_MIN) // 4)
+_ttl_edges = list(range(TTL_MIN, TTL_MAX + 1, _ttl_step))
+if _ttl_edges[-1] < TTL_MAX:
+    _ttl_edges.append(TTL_MAX)
+_ttl_labels = [f"{_ttl_edges[i]}-{_ttl_edges[i+1]}s" for i in range(len(_ttl_edges) - 1)]
 known["ttl_bin"] = pd.cut(
     known["seconds_to_resolution"],
-    bins=[TTL_MIN, 70, 90, 110, 130, 150, TTL_MAX],
-    labels=["55-70s", "70-90s", "90-110s", "110-130s", "130-150s", "150-185s"],
+    bins=_ttl_edges,
+    labels=_ttl_labels,
 )
 ttl_g = known.groupby("ttl_bin", observed=True).agg(
     n=("pnl", "count"),
@@ -286,8 +304,10 @@ print()
 best_thresh_row = df_thresh.loc[df_thresh["EV_per_share"].idxmax()] if not df_thresh.empty else None
 
 report_lines = [
-    "# Backtest Report — Edge 4: Momentum within Epoch",
+    "# Backtest Report — Edge 4: Momentum within Epoch (Filtered)",
     f"**Signal**: mid ≥ {MID_THRESHOLD:.0%}, TTL {TTL_MIN}–{TTL_MAX}s | "
+    f"**Assets**: {', '.join(sorted(ASSETS))} | "
+    f"**Skip UTC hours**: {sorted(SKIP_HOURS)} | "
     f"**Fee**: {FEE_RATE*100:.0f}% | **Stake**: ${STAKE_USDC}/trade | "
     f"**Data**: Apr 18–May 7 2026",
     "",
