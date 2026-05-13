@@ -8,7 +8,7 @@ from pathlib import Path
 # Peaks at price = 0.50, approaches zero at 0.01 and 0.99. Only takers pay.
 # Makers receive rebates (not modeled here — we assume taker execution).
 CATEGORY_FEE_RATES: dict[str, float] = {
-    "crypto": 0.072,
+    "crypto": 0.07,
     "economics": 0.05,
     "culture": 0.05,
     "weather": 0.05,

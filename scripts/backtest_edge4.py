@@ -9,7 +9,8 @@ Signal rule: first orderbook snapshot per (condition_id, side) where
 
 Entry price: best_ask at that snapshot.
 Exit: resolution — payout $1/share on win, $0 on loss.
-Fee: 2% of notional (Polymarket taker).
+Fee: Polymarket crypto taker fee = rate × p × (1-p) × shares
+     rate=0.07, p=ask, shares=stake/ask  →  fee_usdc = 0.07 × (1-ask) × stake
 PnL = payout - stake - fee.
 
 Outcome ground truth: paper_trades_*.csv (condition_id → winner).
@@ -28,7 +29,7 @@ warnings.filterwarnings("ignore")
 
 DATA = "/home/mma/polymarket-sniper/data"
 STAKE_USDC = 1.0
-FEE_RATE = 0.02
+FEE_RATE = 0.07  # Polymarket crypto taker rate; effective fee = rate*(1-ask)*stake
 MID_THRESHOLD = 0.70
 TTL_MIN = 90
 TTL_MAX = 110
@@ -162,7 +163,7 @@ if len(known) < 10:
 # ─────────────────────────────────────────────────────────────────────────────
 known["won"] = (known["side"] == known["winner"]).astype(int)
 known["shares"] = STAKE_USDC / known["best_ask"]
-known["fee_usdc"] = FEE_RATE * STAKE_USDC
+known["fee_usdc"] = FEE_RATE * (1.0 - known["best_ask"]) * STAKE_USDC
 known["payout"] = known["won"] * known["shares"]
 known["pnl"] = known["payout"] - STAKE_USDC - known["fee_usdc"]
 known["window"] = known["market_slug"].apply(extract_window)
@@ -206,7 +207,7 @@ for thresh in [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]:
         continue
     wr_s = sub["won"].mean()
     avg_ask = sub["best_ask"].mean()
-    ev = wr_s * 1.0 - avg_ask - FEE_RATE * avg_ask
+    ev = wr_s - avg_ask - FEE_RATE * avg_ask * (1.0 - avg_ask)
     ci_l, ci_h = bootstrap_ci(sub["won"].values)
     threshold_rows.append({
         "mid_threshold": f">={thresh:.0%}",
@@ -308,7 +309,7 @@ report_lines = [
     f"**Signal**: mid ≥ {MID_THRESHOLD:.0%}, TTL {TTL_MIN}–{TTL_MAX}s | "
     f"**Assets**: {', '.join(sorted(ASSETS))} | "
     f"**Skip UTC hours**: {sorted(SKIP_HOURS)} | "
-    f"**Fee**: {FEE_RATE*100:.0f}% | **Stake**: ${STAKE_USDC}/trade | "
+    f"**Fee**: 7% rate, curved: 0.07×(1-ask)×stake | **Stake**: ${STAKE_USDC}/trade | "
     f"**Data**: Apr 18–May 7 2026",
     "",
     "## Summary",
@@ -358,7 +359,7 @@ report_lines += [
     "",
     "## Notes",
     "- Outcome ground truth from paper_trades CSVs; markets without a known winner are excluded.",
-    "- Entry at best_ask (taker). Fee = 2% × stake. One entry per (condition_id, side).",
+    "- Entry at best_ask (taker). Fee = 0.07 × (1-ask) × stake (Polymarket curved crypto taker fee). One entry per (condition_id, side).",
     "- Max drawdown computed on per-$1-stake basis; scale linearly for larger position sizes.",
 ]
 

@@ -10,8 +10,13 @@ import pytest
 from src.paper_trader import (
     PaperTrade,
     PaperTrader,
-    SIGNAL_RULES,
     STAKE_USDC,
+    EDGE4_LABEL,
+    EDGE4_MID_THRESHOLD,
+    EDGE4_TTL_MIN_S,
+    EDGE4_TTL_MAX_S,
+    EDGE4_ASSETS,
+    EDGE4_SKIP_UTC_HOURS,
     _CSV_HEADER,
 )
 from src.scanner import Market
@@ -35,72 +40,126 @@ def _make_market(end_offset_s: float = 60.0, condition_id: str = "0xabc") -> Mar
     )
 
 
-def test_signal_rules_cover_two_validated_buckets() -> None:
-    assert len(SIGNAL_RULES) == 2
-    labels = [r[4] for r in SIGNAL_RULES]
-    assert "T=60s_0.95-1.00" in labels
-    assert "T=270s_0.70-0.85" in labels
-    # These were dropped (negative realistic EV)
-    assert "T=10s_0.95-1.00" not in labels
-    assert "T=60s_0.90-0.95" not in labels
+def test_edge4_constants_are_correct() -> None:
+    assert EDGE4_MID_THRESHOLD == 0.80
+    assert EDGE4_TTL_MIN_S == 90.0
+    assert EDGE4_TTL_MAX_S == 110.0
+    assert "BTC" in EDGE4_ASSETS
+    assert "ETH" not in EDGE4_ASSETS
+    assert EDGE4_SKIP_UTC_HOURS == frozenset({2, 7, 9, 14, 18})
+    assert EDGE4_LABEL == "E4_TTL90-110s_0.80-1.00"
 
 
 def test_stake_usdc_is_one_dollar() -> None:
     assert STAKE_USDC == 1.0
 
 
-def test_evaluate_signals_fires_in_time_and_price_window() -> None:
+def test_evaluate_signals_fires_in_edge4_window() -> None:
     trader = PaperTrader()
-    market = _make_market(end_offset_s=60.0)
+    # T-100s (center of 90-110s window), mid=0.85 (bid=0.84, ask=0.86)
+    market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    # Build a book with ask at 0.97 (in 0.95-1.00 bucket)
-    trader._book_asks[market.up_token_id] = {0.97: 100.0}
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[market.up_token_id] = {0.84: 100.0}  # mid = 0.85
 
-    now = market.end_time - timedelta(seconds=60)  # exactly T-60s
+    now = market.end_time - timedelta(seconds=100)
     trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 1
     trade = trader._open_trades[0]
-    assert trade.entry_price == 0.97
-    assert trade.signal_bucket_label == "T=60s_0.95-1.00"
+    assert trade.entry_price == 0.86
+    assert trade.signal_bucket_label == EDGE4_LABEL
 
 
 def test_evaluate_signals_respects_deduplication() -> None:
     trader = PaperTrader()
-    market = _make_market(end_offset_s=60.0)
+    market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.97: 100.0}
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[market.up_token_id] = {0.84: 100.0}
 
-    now = market.end_time - timedelta(seconds=60)
+    now = market.end_time - timedelta(seconds=100)
     trader._evaluate_signals(market.up_token_id, now)
     trader._evaluate_signals(market.up_token_id, now)  # second call should be ignored
 
     assert len(trader._open_trades) == 1
 
 
-def test_evaluate_signals_no_fire_outside_time_window() -> None:
+def test_evaluate_signals_no_fire_outside_ttl_window() -> None:
     trader = PaperTrader()
-    market = _make_market(end_offset_s=120.0)  # T-120s
+    market = _make_market(end_offset_s=60.0)  # T-60s — outside 90-110s window
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.97: 100.0}
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[market.up_token_id] = {0.84: 100.0}
 
-    now = market.end_time - timedelta(seconds=120)
+    now = market.end_time - timedelta(seconds=60)
     trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 0
 
 
-def test_evaluate_signals_no_fire_outside_price_bucket() -> None:
+def test_evaluate_signals_no_fire_below_mid_threshold() -> None:
     trader = PaperTrader()
-    market = _make_market(end_offset_s=60.0)
+    market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.85: 100.0}  # below 0.90 minimum
+    # mid = 0.70 (bid=0.68, ask=0.72) — below 0.80 threshold
+    trader._book_asks[market.up_token_id] = {0.72: 100.0}
+    trader._book_bids[market.up_token_id] = {0.68: 100.0}
 
-    now = market.end_time - timedelta(seconds=60)
+    now = market.end_time - timedelta(seconds=100)
+    trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 0
+
+
+def test_evaluate_signals_no_fire_for_eth() -> None:
+    trader = PaperTrader()
+    now = datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
+    eth_market = Market(
+        condition_id="0xeth",
+        question="Ethereum Up or Down - April 20, 8:00AM-8:05AM ET",
+        asset="ETH",
+        start_time=now,
+        end_time=now + timedelta(seconds=100),
+        up_token_id="token_up_eth",
+        down_token_id="token_down_eth",
+        slug="eth-updown-5m-test",
+        raw={},
+    )
+    trader._tracked[eth_market.condition_id] = eth_market
+    trader._token_to_market[eth_market.up_token_id] = (eth_market, "Up")
+    trader._book_asks[eth_market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[eth_market.up_token_id] = {0.84: 100.0}
+
+    trader._evaluate_signals(eth_market.up_token_id, now)
+
+    assert len(trader._open_trades) == 0
+
+
+def test_evaluate_signals_no_fire_during_skip_hour() -> None:
+    trader = PaperTrader()
+    # Use UTC hour 7 which is in EDGE4_SKIP_UTC_HOURS
+    now = datetime(2026, 4, 20, 7, 0, 0, tzinfo=UTC)
+    market = Market(
+        condition_id="0xskip",
+        question="Bitcoin Up or Down",
+        asset="BTC",
+        start_time=now,
+        end_time=now + timedelta(seconds=100),
+        up_token_id="token_up_skip",
+        down_token_id="token_down_skip",
+        slug="btc-updown-skip",
+        raw={},
+    )
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[market.up_token_id] = {0.84: 100.0}
+
     trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 0
@@ -108,20 +167,21 @@ def test_evaluate_signals_no_fire_outside_price_bucket() -> None:
 
 def test_fire_entry_computes_fee_correctly() -> None:
     trader = PaperTrader()
-    market = _make_market(end_offset_s=60.0)
+    market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.99: 100.0}
+    # mid = 0.85: bid=0.84, ask=0.86
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[market.up_token_id] = {0.84: 100.0}
 
-    now = market.end_time - timedelta(seconds=60)
+    now = market.end_time - timedelta(seconds=100)
     trader._evaluate_signals(market.up_token_id, now)
 
     trade = trader._open_trades[0]
-    # stake=$1, shares = 1/0.99 ≈ 1.0101
-    # fee = shares × 0.072 × 0.99 × 0.01 = 1.0101 × 0.0007128 ≈ 0.00072 USDC
-    expected_fee = (1.0 / 0.99) * 0.072 * 0.99 * 0.01
+    # stake=$1, shares = 1/0.86, fee = shares × 0.07 × 0.86 × 0.14
+    expected_fee = (1.0 / 0.86) * 0.07 * 0.86 * 0.14
     assert abs(trade.fee_usdc - expected_fee) < 1e-4
-    assert abs(trade.simulated_shares - 1.0 / 0.99) < 1e-6
+    assert abs(trade.simulated_shares - 1.0 / 0.86) < 1e-6
 
 
 def test_resolve_open_trades_marks_win_correctly() -> None:
@@ -134,7 +194,7 @@ def test_resolve_open_trades_marks_win_correctly() -> None:
         entry_timestamp_utc=market.end_time - timedelta(seconds=60),
         market=market,
         side="Up",
-        signal_bucket_label="T=60s_0.95-1.00",
+        signal_bucket_label=EDGE4_LABEL,
         signal_target_time_s=60.0,
         seconds_to_resolution_at_entry=60.0,
         entry_price=0.97,
@@ -164,7 +224,7 @@ def test_resolve_open_trades_marks_loss_correctly() -> None:
         entry_timestamp_utc=market.end_time - timedelta(seconds=60),
         market=market,
         side="Up",
-        signal_bucket_label="T=60s_0.95-1.00",
+        signal_bucket_label=EDGE4_LABEL,
         signal_target_time_s=60.0,
         seconds_to_resolution_at_entry=60.0,
         entry_price=0.97,
@@ -196,7 +256,7 @@ def test_resolve_open_trades_stays_open_when_api_returns_none() -> None:
         entry_timestamp_utc=market.end_time - timedelta(seconds=60),
         market=market,
         side="Up",
-        signal_bucket_label="T=60s_0.95-1.00",
+        signal_bucket_label=EDGE4_LABEL,
         signal_target_time_s=60.0,
         seconds_to_resolution_at_entry=60.0,
         entry_price=0.97,
@@ -226,7 +286,7 @@ def test_resolve_open_trades_times_out_as_unknown_after_30min() -> None:
         entry_timestamp_utc=market.end_time - timedelta(seconds=60),
         market=market,
         side="Up",
-        signal_bucket_label="T=60s_0.95-1.00",
+        signal_bucket_label=EDGE4_LABEL,
         signal_target_time_s=60.0,
         seconds_to_resolution_at_entry=60.0,
         entry_price=0.97,
@@ -380,120 +440,79 @@ def test_sweep_unknowns_skips_already_resolved(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_t270_bucket_fires_at_mid_price() -> None:
-    """At T-270s with best_ask=0.75, the T=270s_0.70-0.85 rule should fire."""
+def test_edge4_fires_at_ttl_boundary_low() -> None:
+    """At exactly T-90s (lower bound) with mid>=0.80 the signal fires."""
     trader = PaperTrader()
-    market = _make_market(end_offset_s=270.0)
+    market = _make_market(end_offset_s=90.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.75: 100.0}
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[market.up_token_id] = {0.84: 100.0}  # mid=0.85
 
-    with patch.object(trader._price_feed, "get_direction", return_value="Up"):
-        now = market.end_time - timedelta(seconds=270)
-        trader._evaluate_signals(market.up_token_id, now)
-
-    assert len(trader._open_trades) == 1
-    trade = trader._open_trades[0]
-    assert trade.entry_price == 0.75
-    assert trade.signal_bucket_label == "T=270s_0.70-0.85"
-
-
-def test_t270_bucket_respects_tolerance_boundary() -> None:
-    """At T-241s (within 30s tolerance of 270s) the rule should fire."""
-    trader = PaperTrader()
-    market = _make_market(end_offset_s=241.0)
-    trader._tracked[market.condition_id] = market
-    trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.78: 100.0}
-
-    with patch.object(trader._price_feed, "get_direction", return_value="Up"):
-        now = market.end_time - timedelta(seconds=241)
-        trader._evaluate_signals(market.up_token_id, now)
+    now = market.end_time - timedelta(seconds=90)
+    trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 1
 
 
-def test_t270_bucket_does_not_fire_outside_tolerance() -> None:
-    """At T-200s (outside 30s tolerance of 270s) the rule should NOT fire."""
+def test_edge4_fires_at_ttl_boundary_high() -> None:
+    """At exactly T-110s (upper bound) with mid>=0.80 the signal fires."""
     trader = PaperTrader()
-    market = _make_market(end_offset_s=200.0)
+    market = _make_market(end_offset_s=110.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.78: 100.0}
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[market.up_token_id] = {0.84: 100.0}
 
-    now = market.end_time - timedelta(seconds=200)
+    now = market.end_time - timedelta(seconds=110)
+    trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 1
+
+
+def test_edge4_no_fire_just_outside_ttl_window() -> None:
+    """At T-89s (just outside lower bound) the signal does NOT fire."""
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=89.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    trader._book_bids[market.up_token_id] = {0.84: 100.0}
+
+    now = market.end_time - timedelta(seconds=89)
     trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 0
 
 
-# ---------------------------------------------------------------------------
-# Binance momentum filter tests
-# ---------------------------------------------------------------------------
-
-
-def test_t270_fires_when_binance_direction_matches() -> None:
-    """T=270s entry fires when Binance direction agrees with the side."""
+def test_edge4_fires_at_exact_mid_threshold() -> None:
+    """At mid exactly 0.80 (bid=0.78, ask=0.82) the signal fires."""
     trader = PaperTrader()
-    market = _make_market(end_offset_s=270.0)
+    market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.75: 100.0}
+    trader._book_asks[market.up_token_id] = {0.82: 100.0}
+    trader._book_bids[market.up_token_id] = {0.78: 100.0}  # mid=0.80
 
-    with patch.object(trader._price_feed, "get_direction", return_value="Up"):
-        now = market.end_time - timedelta(seconds=270)
-        trader._evaluate_signals(market.up_token_id, now)
+    now = market.end_time - timedelta(seconds=100)
+    trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 1
-    assert trader._binance_filtered_skips == 0
 
 
-def test_t270_skips_when_binance_direction_is_none() -> None:
-    """T=270s entry is skipped when Binance has no direction data."""
+def test_edge4_no_fire_no_bid_in_book() -> None:
+    """When there is no bid in the book, mid cannot be computed — no fire."""
     trader = PaperTrader()
-    market = _make_market(end_offset_s=270.0)
+    market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.75: 100.0}
+    trader._book_asks[market.up_token_id] = {0.86: 100.0}
+    # No bids set — _best_bid returns None
 
-    with patch.object(trader._price_feed, "get_direction", return_value=None):
-        now = market.end_time - timedelta(seconds=270)
-        trader._evaluate_signals(market.up_token_id, now)
+    now = market.end_time - timedelta(seconds=100)
+    trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 0
-    assert trader._binance_filtered_skips == 1
-
-
-def test_t270_skips_when_binance_direction_opposes_side() -> None:
-    """T=270s Up entry is skipped when Binance says Down."""
-    trader = PaperTrader()
-    market = _make_market(end_offset_s=270.0)
-    trader._tracked[market.condition_id] = market
-    trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.75: 100.0}
-
-    with patch.object(trader._price_feed, "get_direction", return_value="Down"):
-        now = market.end_time - timedelta(seconds=270)
-        trader._evaluate_signals(market.up_token_id, now)
-
-    assert len(trader._open_trades) == 0
-    assert trader._binance_filtered_skips == 1
-
-
-def test_other_buckets_not_filtered_by_binance() -> None:
-    """Non-T=270s buckets fire regardless of Binance direction."""
-    trader = PaperTrader()
-    market = _make_market(end_offset_s=60.0)
-    trader._tracked[market.condition_id] = market
-    trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.97: 100.0}
-
-    with patch.object(trader._price_feed, "get_direction", return_value=None):
-        now = market.end_time - timedelta(seconds=60)
-        trader._evaluate_signals(market.up_token_id, now)
-
-    assert len(trader._open_trades) == 1
-    assert trader._binance_filtered_skips == 0
 
 
 # ---------------------------------------------------------------------------

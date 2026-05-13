@@ -14,3 +14,8 @@ data/*.json
 .coverage
 htmlcov/
 .claude/
+
+# Generated reports and backups
+data/*.md
+data/*.bak
+data/*_broken.csv

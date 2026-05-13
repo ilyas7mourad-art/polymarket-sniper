@@ -37,15 +37,15 @@ RESOLUTION_TIMEOUT_SECONDS = 1800  # 30 minutes — Polymarket CLOB closure can 
 SWEEP_INTERVAL_SECONDS = 300       # 5 minutes between sweep passes
 SWEEP_MAX_AGE_SECONDS = 6 * 3600   # 6 hours — after this, give up permanently on unknown trades
 
-# Signal rules: each is (target_seconds, seconds_tolerance, min_ask, max_ask, label).
-# Validated by realistic execution analysis (PR #16): T=270s_0.70-0.85 shows
-# +6.5¢/$ EV at $25 stake; T=60s_0.95-1.00 shows +2.4¢/$ EV. The previously-tested
-# T=10s_0.95-1.00 and T=60s_0.90-0.95 buckets were dropped — both showed negative
-# realistic EV across stake sizes ($1, $5, $25).
-SIGNAL_RULES: list[tuple[float, float, float, float, str]] = [
-    (60.0, 5.0, 0.95, 1.00, "T=60s_0.95-1.00"),
-    (270.0, 30.0, 0.70, 0.85, "T=270s_0.70-0.85"),
-]
+# Edge 4 signal params — final validated 2026-05-10.
+# Backtest (real fees): WR=92.7%, Sharpe=0.095, Max DD=-$5.68 at $1/trade over 20 days.
+EDGE4_MID_THRESHOLD = 0.80          # orderbook mid ≥ 80%
+EDGE4_TTL_MIN_S = 90.0              # seconds to resolution window
+EDGE4_TTL_MAX_S = 110.0
+EDGE4_ASSETS = frozenset({"BTC"})   # BTC only; ETH edge is negative
+EDGE4_SKIP_UTC_HOURS = frozenset({2, 7, 9, 14, 18})  # extended skip set (improves Sharpe)
+# Label suffix 0.80-1.00 is used by _simulate_realistic_fill to parse the ask range.
+EDGE4_LABEL = "E4_TTL90-110s_0.80-1.00"
 
 _CSV_HEADER = [
     "trade_id",
@@ -333,8 +333,13 @@ class PaperTrader:
         active = [p for p, s in asks.items() if s > 0]
         return min(active) if active else None
 
+    def _best_bid(self, asset_id: str) -> Optional[float]:
+        bids = self._book_bids.get(asset_id, {})
+        active = [p for p, s in bids.items() if s > 0]
+        return max(active) if active else None
+
     # ------------------------------------------------------------------
-    # Signal evaluation
+    # Signal evaluation — Edge 4
     # ------------------------------------------------------------------
 
     def _evaluate_signals(self, asset_id: str, now: datetime) -> None:
@@ -343,37 +348,34 @@ class PaperTrader:
             return
         market, side = entry
 
-        # Skip if we already entered this market/side
+        # BTC-only filter
+        if market.asset not in EDGE4_ASSETS:
+            return
+
+        # UTC hour skip filter
+        if now.hour in EDGE4_SKIP_UTC_HOURS:
+            return
+
+        # Dedup: one entry per (condition_id, side)
         key = (market.condition_id, side)
         if key in self._entered:
             return
 
         best_ask = self._best_ask(asset_id)
-        if best_ask is None:
+        best_bid = self._best_bid(asset_id)
+        if best_ask is None or best_bid is None:
             return
 
+        mid = (best_ask + best_bid) / 2.0
         seconds_to_resolution = (market.end_time - now).total_seconds()
         if seconds_to_resolution < 0:
             return
 
-        for target_s, tol_s, min_ask, max_ask, label in SIGNAL_RULES:
-            in_time_window = abs(seconds_to_resolution - target_s) <= tol_s
-            in_price_bucket = min_ask <= best_ask < max_ask
-            if in_time_window and in_price_bucket:
-                if label == "T=270s_0.70-0.85":
-                    binance_dir = self._price_feed.get_direction(market.asset)
-                    if binance_dir is None or binance_dir != side:
-                        self._binance_filtered_skips += 1
-                        logger.debug(
-                            "Binance filter skipped %s %s (binance_dir=%s)",
-                            market.slug, side, binance_dir,
-                        )
-                        return
-                self._fire_entry(
-                    market, side, best_ask, seconds_to_resolution,
-                    target_s, label, now,
-                )
-                return  # one entry fires at most per tick
+        if (EDGE4_TTL_MIN_S <= seconds_to_resolution <= EDGE4_TTL_MAX_S
+                and mid >= EDGE4_MID_THRESHOLD):
+            target_s = (EDGE4_TTL_MIN_S + EDGE4_TTL_MAX_S) / 2.0
+            self._fire_entry(market, side, best_ask, seconds_to_resolution,
+                             target_s, EDGE4_LABEL, now)
 
     def _fire_entry(
         self,
@@ -611,7 +613,7 @@ class PaperTrader:
                 and trade.winner != "unknown"
             ):
                 cost = trade.live_filled_shares * trade.live_fill_price
-                fee = trade.live_filled_shares * 0.072 * trade.live_fill_price * (1 - trade.live_fill_price)
+                fee = trade.live_filled_shares * DEFAULT_FEE_RATE * trade.live_fill_price * (1 - trade.live_fill_price)
                 if trade.winner == trade.side:
                     trade.live_pnl_usdc = trade.live_filled_shares - cost - fee
                 else:
