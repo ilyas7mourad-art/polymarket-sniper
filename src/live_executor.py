@@ -1,23 +1,72 @@
-"""Live executor for Polymarket: places real FAK orders via py-clob-client SDK."""
+"""Live executor for Polymarket: places real FAK orders via direct REST + EIP-712.
+
+Replaces py-clob-client (broken since Polymarket contract migration May 2026).
+Uses eth_account for EIP-712 signing and requests for HTTP — no external Polymarket SDK.
+"""
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import math
+import random
+import time
 from dataclasses import dataclass
 from typing import Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    ApiCreds,
-    AssetType,
-    BalanceAllowanceParams,
-    OrderArgs,
-    OrderType,
-)
+import requests
+from eth_account import Account
 
 from src.config import config
 
 logger = logging.getLogger(__name__)
+
+# ── Contract addresses (Polygon mainnet, verified active May 2026) ─────────────
+EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+NEG_RISK_EXCHANGE_ADDRESS = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+# ── EIP-712 types ──────────────────────────────────────────────────────────────
+_ORDER_DOMAIN_BASE = {
+    "name": "Polymarket CTF Exchange",
+    "version": "1",
+    "chainId": 137,
+}
+
+_ORDER_TYPES = {
+    "Order": [
+        {"name": "salt", "type": "uint256"},
+        {"name": "maker", "type": "address"},
+        {"name": "signer", "type": "address"},
+        {"name": "taker", "type": "address"},
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "makerAmount", "type": "uint256"},
+        {"name": "takerAmount", "type": "uint256"},
+        {"name": "expiration", "type": "uint256"},
+        {"name": "nonce", "type": "uint256"},
+        {"name": "feeRateBps", "type": "uint256"},
+        {"name": "side", "type": "uint8"},
+        {"name": "signatureType", "type": "uint8"},
+    ]
+}
+
+_AUTH_DOMAIN = {"name": "ClobAuthDomain", "version": "1", "chainId": 137}
+
+_AUTH_TYPES = {
+    "ClobAuth": [
+        {"name": "address", "type": "address"},
+        {"name": "timestamp", "type": "string"},
+        {"name": "nonce", "type": "uint256"},
+        {"name": "message", "type": "string"},
+    ]
+}
+
+_MSG_TO_SIGN = "This message attests that I control the given wallet"
+
+# signatureType value for Gnosis Safe proxy wallets (UI-created wallets)
+_POLY_GNOSIS_SAFE = 2
 
 
 def compute_clean_order_amounts(stake_usdc: float, price: float) -> tuple[float, float]:
@@ -26,23 +75,11 @@ def compute_clean_order_amounts(stake_usdc: float, price: float) -> tuple[float,
     Polymarket requires:
       - shares (taker amount) ≤ 4 decimal places
       - shares × price (maker USDC) ≤ 2 decimal places
-
-    Uses integer arithmetic to find the largest share count satisfying both
-    constraints simultaneously. For shares = s/10000 and price = p/100,
-    the product s*p/1000000 is 2-decimal iff s*p is divisible by 10000,
-    i.e. s is a multiple of 10000/gcd(p, 10000).
-
-    Returns:
-        (size_shares, actual_notional_usdc). actual_notional may be slightly
-        less than stake_usdc due to rounding.
     """
-    p = round(price * 100)              # price in integer cents (0.70 → 70)
-    stake_cents = round(stake_usdc * 100)  # stake in integer cents (5.0 → 500)
+    p = round(price * 100)
+    stake_cents = round(stake_usdc * 100)
 
-    # s must be a multiple of this step to keep s*p divisible by 10000
     step = 10000 // math.gcd(p, 10000)
-
-    # Largest s such that s/10000 * p/100 ≤ stake → s*p ≤ stake_cents * 10000
     max_s = (stake_cents * 10000) // p
     s = (max_s // step) * step
 
@@ -66,37 +103,109 @@ class LiveOrderResult:
 
 
 class LiveExecutor:
-    """Wraps py-clob-client for FAK order placement.
+    """Places real FAK orders on Polymarket via direct REST API calls.
 
-    Adds retry-friendly structured results and per-order logging on top of the
-    raw SDK calls.
+    Authentication:
+    - L1 (API key derivation): EIP-712 ClobAuth signature with EOA key
+    - L2 (order posting): HMAC-SHA256 with API secret
+
+    Order signing: EIP-712 Order struct, signed by EOA, with Gnosis Safe proxy as maker.
     """
 
     def __init__(self) -> None:
-        self._client = ClobClient(
-            host=config.CLOB_HOST,
-            chain_id=config.CHAIN_ID,
-            key=config.WALLET_PRIVATE_KEY,
-            signature_type=2,  # POLY_GNOSIS_SAFE
-            funder=config.WALLET_FUNDER,
-        )
-        self._api_creds: Optional[ApiCreds] = None
+        self._account = Account.from_key(config.WALLET_PRIVATE_KEY)
+        self._eoa = config.WALLET_ADDRESS
+        self._funder = config.WALLET_FUNDER  # Gnosis Safe proxy — the onchain maker
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+        self._api_creds: Optional[dict] = None  # {api_key, secret, passphrase}
         self._creds_lock = asyncio.Lock()
 
+    # ── Signing helpers ────────────────────────────────────────────────────────
+
+    def _sign_order(self, order_data: dict, neg_risk: bool = False) -> str:
+        """EIP-712 sign an Order struct. Returns hex signature without 0x prefix."""
+        exchange = NEG_RISK_EXCHANGE_ADDRESS if neg_risk else EXCHANGE_ADDRESS
+        domain = {**_ORDER_DOMAIN_BASE, "verifyingContract": exchange}
+        signed = self._account.sign_typed_data(
+            domain_data=domain,
+            message_types=_ORDER_TYPES,
+            message_data=order_data,
+        )
+        return signed.signature.hex()
+
+    def _sign_clob_auth(self, timestamp: int, nonce: int) -> str:
+        """EIP-712 sign a ClobAuth struct for API key derivation. Returns 0x-prefixed hex."""
+        value = {
+            "address": self._eoa,
+            "timestamp": str(timestamp),
+            "nonce": nonce,
+            "message": _MSG_TO_SIGN,
+        }
+        signed = self._account.sign_typed_data(
+            domain_data=_AUTH_DOMAIN,
+            message_types=_AUTH_TYPES,
+            message_data=value,
+        )
+        return "0x" + signed.signature.hex()
+
+    def _l1_headers(self, nonce: int = 0) -> dict:
+        ts = int(time.time())
+        return {
+            "POLY_ADDRESS": self._eoa,
+            "POLY_SIGNATURE": self._sign_clob_auth(ts, nonce),
+            "POLY_TIMESTAMP": str(ts),
+            "POLY_NONCE": str(nonce),
+        }
+
+    def _l2_headers(self, method: str, path: str, body: str = "") -> dict:
+        ts = int(time.time())
+        secret_bytes = base64.urlsafe_b64decode(self._api_creds["secret"])
+        message = str(ts) + method + path + body
+        sig = base64.urlsafe_b64encode(
+            hmac.new(secret_bytes, message.encode(), hashlib.sha256).digest()
+        ).decode()
+        return {
+            "POLY_ADDRESS": self._eoa,
+            "POLY_SIGNATURE": sig,
+            "POLY_TIMESTAMP": str(ts),
+            "POLY_API_KEY": self._api_creds["api_key"],
+            "POLY_PASSPHRASE": self._api_creds["passphrase"],
+        }
+
+    # ── API credential management ──────────────────────────────────────────────
+
     async def _ensure_api_creds(self) -> None:
-        """Lazily derive API credentials from the wallet (cached after first call)."""
         if self._api_creds is not None:
             return
         async with self._creds_lock:
             if self._api_creds is not None:
                 return
-            try:
-                creds = await asyncio.to_thread(self._client.derive_api_key)
-            except Exception:
-                creds = await asyncio.to_thread(self._client.create_or_derive_api_creds)
-            self._client.set_api_creds(creds)
-            self._api_creds = creds
-            logger.info("API credentials initialized for wallet %s", config.WALLET_ADDRESS)
+            headers = self._l1_headers()
+            # Try to derive existing key first
+            resp = await asyncio.to_thread(
+                self._session.get,
+                f"{config.CLOB_HOST}/auth/api-key",
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                # Create a new key
+                headers = self._l1_headers()
+                resp = await asyncio.to_thread(
+                    self._session.post,
+                    f"{config.CLOB_HOST}/auth/api-key",
+                    headers=headers,
+                )
+                resp.raise_for_status()
+            data = resp.json()
+            self._api_creds = {
+                "api_key": data["apiKey"],
+                "secret": data["secret"],
+                "passphrase": data["passphrase"],
+            }
+            logger.info("API credentials ready for %s", self._eoa)
+
+    # ── Order placement ────────────────────────────────────────────────────────
 
     async def place_order(
         self,
@@ -104,36 +213,88 @@ class LiveExecutor:
         price: float,
         size_shares: float,
         side: str = "BUY",
+        neg_risk: bool = False,
     ) -> LiveOrderResult:
         """Place a FAK (Fill-and-Kill) order.
 
         Args:
             token_id: Polymarket asset/token ID.
-            price: Limit price.
+            price: Limit price (0–1).
             size_shares: Number of shares to buy.
             side: "BUY" or "SELL".
+            neg_risk: True for multi-outcome (neg-risk) markets.
 
         Returns:
             LiveOrderResult with fill details.
         """
         await self._ensure_api_creds()
 
-        order_args = OrderArgs(
-            price=price,
-            size=size_shares,
-            side=side,
-            token_id=token_id,
-        )
+        # Amounts in micro-units (6 decimals): USDC × 1e6
+        # BUY: maker gives USDC (makerAmount), receives shares (takerAmount)
+        maker_amount = int(round(price * size_shares * 1_000_000))
+        taker_amount = int(round(size_shares * 1_000_000))
+        salt = random.randint(1, 2**128)
+        side_int = 0 if side == "BUY" else 1
+
+        order_eip712 = {
+            "salt": salt,
+            "maker": self._funder,
+            "signer": self._eoa,
+            "taker": ZERO_ADDRESS,
+            "tokenId": int(token_id),
+            "makerAmount": maker_amount,
+            "takerAmount": taker_amount,
+            "expiration": 0,
+            "nonce": 0,
+            "feeRateBps": 0,
+            "side": side_int,
+            "signatureType": _POLY_GNOSIS_SAFE,
+        }
 
         try:
-            signed_order = await asyncio.to_thread(self._client.create_order, order_args)
-            response = await asyncio.to_thread(
-                self._client.post_order,
-                signed_order,
-                OrderType.FAK,
-            )
+            signature = await asyncio.to_thread(self._sign_order, order_eip712, neg_risk)
         except Exception as exc:
-            logger.warning("Order placement failed for token %s: %s", token_id, exc)
+            logger.warning("Order signing failed: %s", exc)
+            return LiveOrderResult(
+                order_id=None,
+                fill_status="error",
+                avg_fill_price=None,
+                filled_shares=0.0,
+                error_message=f"signing: {exc}",
+            )
+
+        body = {
+            "order": {
+                "salt": salt,
+                "maker": self._funder,
+                "signer": self._eoa,
+                "taker": ZERO_ADDRESS,
+                "tokenId": str(int(token_id)),
+                "makerAmount": str(maker_amount),
+                "takerAmount": str(taker_amount),
+                "side": side,
+                "expiration": "0",
+                "nonce": "0",
+                "feeRateBps": "0",
+                "signatureType": _POLY_GNOSIS_SAFE,
+                "signature": "0x" + signature,
+            },
+            "owner": self._api_creds["api_key"],
+            "orderType": "FAK",
+        }
+        body_str = json.dumps(body, separators=(",", ":"))
+        headers = self._l2_headers("POST", "/order", body_str)
+
+        try:
+            resp = await asyncio.to_thread(
+                self._session.post,
+                f"{config.CLOB_HOST}/order",
+                headers=headers,
+                data=body_str,
+            )
+            response = resp.json()
+        except Exception as exc:
+            logger.warning("Order POST failed for token %s: %s", token_id[:12], exc)
             return LiveOrderResult(
                 order_id=None,
                 fill_status="error",
@@ -156,7 +317,6 @@ class LiveExecutor:
                 error_message=err,
             )
 
-        # FAK responses report fills via makingAmount (shares) or takingAmount (USDC)
         matched_amount = float(response.get("makingAmount", 0) or 0) or float(
             response.get("takingAmount", 0) or 0
         )
@@ -179,9 +339,8 @@ class LiveExecutor:
                 pass
 
         status = "filled" if abs(filled_shares - size_shares) < 0.01 else "partial"
-
         logger.info(
-            "ORDER %s: %s %.4f @ %.4f, filled %.2f shares (status=%s, order_id=%s)",
+            "ORDER %s: %s %.4f @ %.4f, filled %.2f shares (status=%s, id=%s)",
             side,
             token_id[:12],
             size_shares,
@@ -198,19 +357,25 @@ class LiveExecutor:
             error_message=None,
         )
 
+    # ── Balance ────────────────────────────────────────────────────────────────
+
     async def get_balance(self) -> float:
-        """Return USDC balance of the wallet as a float."""
+        """Return USDC balance of the proxy wallet."""
         await self._ensure_api_creds()
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        path = "/balance-allowance"
+        headers = self._l2_headers("GET", path)
         try:
-            balance_resp = await asyncio.to_thread(
-                self._client.get_balance_allowance, params
+            resp = await asyncio.to_thread(
+                self._session.get,
+                f"{config.CLOB_HOST}{path}",
+                headers=headers,
+                params={"asset_type": "COLLATERAL"},
             )
+            data = resp.json()
         except Exception as exc:
             logger.warning("Balance fetch failed: %s", exc)
             return 0.0
-        balance_raw = balance_resp.get("balance", "0")
         try:
-            return float(balance_raw) / 1e6
+            return float(data.get("balance", "0")) / 1_000_000
         except (ValueError, TypeError):
             return 0.0
