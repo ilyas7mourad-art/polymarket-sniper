@@ -1,7 +1,8 @@
 """Live executor for Polymarket: places real FAK orders via direct REST + EIP-712.
 
-Replaces py-clob-client (broken since Polymarket contract migration May 2026).
+Replaces py-clob-client (broken since Polymarket CLOB V2 migration April 28 2026).
 Uses eth_account for EIP-712 signing and requests for HTTP — no external Polymarket SDK.
+Implements CLOB V2 order struct (timestamp replaces nonce; taker/nonce/feeRateBps removed).
 """
 
 import asyncio
@@ -23,15 +24,17 @@ from src.config import config
 
 logger = logging.getLogger(__name__)
 
-# ── Contract addresses (Polygon mainnet, verified active May 2026) ─────────────
-EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-NEG_RISK_EXCHANGE_ADDRESS = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+# ── Contract addresses (Polygon mainnet, CLOB V2 — active from April 28 2026) ──
+EXCHANGE_ADDRESS = "0xE111180000d2663C0091e4f400237545B87B996B"
+NEG_RISK_EXCHANGE_ADDRESS = "0xe2222d279d744050d28e00520010520000310F59"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+_ZERO_BYTES32 = b"\x00" * 32  # metadata / builder default
 
-# ── EIP-712 types ──────────────────────────────────────────────────────────────
+# ── EIP-712 types (CLOB V2) ────────────────────────────────────────────────────
+# Domain version bumped to "2" in V2; ClobAuthDomain stays at "1" (unchanged).
 _ORDER_DOMAIN_BASE = {
     "name": "Polymarket CTF Exchange",
-    "version": "1",
+    "version": "2",
     "chainId": 137,
 }
 
@@ -40,15 +43,14 @@ _ORDER_TYPES = {
         {"name": "salt", "type": "uint256"},
         {"name": "maker", "type": "address"},
         {"name": "signer", "type": "address"},
-        {"name": "taker", "type": "address"},
         {"name": "tokenId", "type": "uint256"},
         {"name": "makerAmount", "type": "uint256"},
         {"name": "takerAmount", "type": "uint256"},
-        {"name": "expiration", "type": "uint256"},
-        {"name": "nonce", "type": "uint256"},
-        {"name": "feeRateBps", "type": "uint256"},
         {"name": "side", "type": "uint8"},
         {"name": "signatureType", "type": "uint8"},
+        {"name": "timestamp", "type": "uint256"},
+        {"name": "metadata", "type": "bytes32"},
+        {"name": "builder", "type": "bytes32"},
     ]
 }
 
@@ -181,15 +183,15 @@ class LiveExecutor:
         async with self._creds_lock:
             if self._api_creds is not None:
                 return
+            # Try to derive existing key first (/auth/derive-api-key)
             headers = self._l1_headers()
-            # Try to derive existing key first
             resp = await asyncio.to_thread(
                 self._session.get,
-                f"{config.CLOB_HOST}/auth/api-key",
+                f"{config.CLOB_HOST}/auth/derive-api-key",
                 headers=headers,
             )
             if resp.status_code != 200:
-                # Create a new key
+                # No key yet — create one (/auth/api-key POST)
                 headers = self._l1_headers()
                 resp = await asyncio.to_thread(
                     self._session.post,
@@ -233,22 +235,26 @@ class LiveExecutor:
         # BUY: maker gives USDC (makerAmount), receives shares (takerAmount)
         maker_amount = int(round(price * size_shares * 1_000_000))
         taker_amount = int(round(size_shares * 1_000_000))
-        salt = random.randint(1, 2**128)
+        # Salt must fit in JS safe-integer range (2^53-1); mirrors TS SDK's
+        # Math.round(Math.random() * Date.now()) which tops out at ~1.7e12
+        salt = random.randint(1, 9_007_199_254_740_991)
         side_int = 0 if side == "BUY" else 1
+        # V2: timestamp (ms) replaces nonce for per-address order uniqueness
+        timestamp_ms = int(time.time() * 1000)
 
+        # V2 Order struct: taker/nonce/feeRateBps/expiration removed; timestamp/metadata/builder added
         order_eip712 = {
             "salt": salt,
             "maker": self._funder,
             "signer": self._eoa,
-            "taker": ZERO_ADDRESS,
             "tokenId": int(token_id),
             "makerAmount": maker_amount,
             "takerAmount": taker_amount,
-            "expiration": 0,
-            "nonce": 0,
-            "feeRateBps": 0,
             "side": side_int,
             "signatureType": _POLY_GNOSIS_SAFE,
+            "timestamp": timestamp_ms,
+            "metadata": _ZERO_BYTES32,
+            "builder": _ZERO_BYTES32,
         }
 
         try:
@@ -263,21 +269,22 @@ class LiveExecutor:
                 error_message=f"signing: {exc}",
             )
 
+        _zero_b32_hex = "0x" + "00" * 32
         body = {
+            "deferExec": False,
             "order": {
                 "salt": salt,
                 "maker": self._funder,
                 "signer": self._eoa,
-                "taker": ZERO_ADDRESS,
                 "tokenId": str(int(token_id)),
                 "makerAmount": str(maker_amount),
                 "takerAmount": str(taker_amount),
                 "side": side,
-                "expiration": "0",
-                "nonce": "0",
-                "feeRateBps": "0",
                 "signatureType": _POLY_GNOSIS_SAFE,
                 "signature": "0x" + signature,
+                "timestamp": timestamp_ms,
+                "metadata": _zero_b32_hex,
+                "builder": _zero_b32_hex,
             },
             "owner": self._api_creds["api_key"],
             "orderType": "FAK",
@@ -293,6 +300,7 @@ class LiveExecutor:
                 data=body_str,
             )
             response = resp.json()
+            logger.debug("POST /order HTTP %s: %s", resp.status_code, response)
         except Exception as exc:
             logger.warning("Order POST failed for token %s: %s", token_id[:12], exc)
             return LiveOrderResult(
@@ -307,7 +315,8 @@ class LiveExecutor:
         order_id = response.get("orderID") or response.get("orderId")
 
         if not success:
-            err = response.get("errorMsg", "unknown error")
+            # Server uses "errorMsg" for app-level rejects, "error" for 4xx payload errors
+            err = response.get("errorMsg") or response.get("error") or "unknown error"
             logger.warning("Order rejected by Polymarket: %s", err)
             return LiveOrderResult(
                 order_id=order_id,

@@ -142,7 +142,7 @@ def test_place_order_uses_taking_amount_fallback() -> None:
 
 
 def test_place_order_body_is_valid_json() -> None:
-    """Verify the POST body is valid JSON with expected fields."""
+    """Verify the POST body is valid JSON with V2 fields."""
     executor = _make_executor()
     captured_body = {}
 
@@ -162,6 +162,13 @@ def test_place_order_body_is_valid_json() -> None:
     assert order["signer"] == _DUMMY_EOA
     assert order["signature"].startswith("0x")
     assert len(order["signature"]) == 132  # 0x + 65 bytes × 2 hex chars
+    # V2: taker/nonce/feeRateBps absent; timestamp/metadata/builder present
+    assert "taker" not in order
+    assert "nonce" not in order
+    assert "feeRateBps" not in order
+    assert isinstance(order["timestamp"], int) and order["timestamp"] > 0
+    assert order["metadata"] == "0x" + "00" * 32
+    assert order["builder"] == "0x" + "00" * 32
 
 
 def test_place_order_neg_risk_uses_different_exchange() -> None:
@@ -229,7 +236,7 @@ def test_get_balance_initializes_creds() -> None:
         "apiKey": "k",
         "secret": "dGVzdA==",
         "passphrase": "p",
-    })
+    }, status=200)
     balance_resp = _mock_get_response({"balance": "5000000"})
 
     call_count = [0]
