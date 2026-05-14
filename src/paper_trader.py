@@ -39,13 +39,13 @@ SWEEP_MAX_AGE_SECONDS = 6 * 3600   # 6 hours — after this, give up permanently
 
 # Edge 4 signal params — final validated 2026-05-10.
 # Backtest (real fees): WR=92.7%, Sharpe=0.095, Max DD=-$5.68 at $1/trade over 20 days.
-EDGE4_MID_THRESHOLD = 0.80          # orderbook mid ≥ 80%
+EDGE4_MID_THRESHOLD = 0.75          # orderbook mid ≥ 75%
 EDGE4_TTL_MIN_S = 90.0              # seconds to resolution window
 EDGE4_TTL_MAX_S = 110.0
 EDGE4_ASSETS = frozenset({"BTC"})   # BTC only; ETH edge is negative
 EDGE4_SKIP_UTC_HOURS = frozenset({2, 7, 9, 14, 18})  # extended skip set (improves Sharpe)
 # Label suffix 0.80-1.00 is used by _simulate_realistic_fill to parse the ask range.
-EDGE4_LABEL = "E4_TTL90-110s_0.80-1.00"
+EDGE4_LABEL = "E4_TTL90-110s_0.75-1.00"
 
 _CSV_HEADER = [
     "trade_id",
@@ -430,6 +430,7 @@ class PaperTrader:
             allowed, reason = self._safety_checker.can_place_order(
                 balance_usdc=self._cached_balance,
                 open_positions=len(self._open_trades),
+                stake_usdc=config.LIVE_STAKE_USDC,
             )
             if not allowed:
                 logger.warning(
@@ -439,19 +440,23 @@ class PaperTrader:
                 trade.live_fill_status = f"blocked:{reason}"
             else:
                 token_id = market.up_token_id if side == "Up" else market.down_token_id
+                # Add 2-cent buffer above signal ask so FAK fills at current market price.
+                # Signal ask is captured at evaluation time; by order arrival the book may
+                # have ticked up 1-2 cents, causing the FAK to find no match and be killed.
+                live_price = min(round(best_ask + 0.05, 2), 0.99)
                 size_shares, actual_notional = compute_clean_order_amounts(
-                    config.LIVE_STAKE_USDC, best_ask
+                    config.LIVE_STAKE_USDC, live_price
                 )
                 logger.debug(
-                    "Clean amounts: %.4f shares × $%.4f = $%.2f notional",
-                    size_shares, best_ask, actual_notional,
+                    "Clean amounts: %.4f shares × $%.4f = $%.2f notional (signal ask=%.4f + 0.02 buffer)",
+                    size_shares, live_price, actual_notional, best_ask,
                 )
-                _live_coro = self._place_live_order(trade, token_id, best_ask, size_shares)
+                _live_coro = self._place_live_order(trade, token_id, live_price, size_shares)
                 try:
                     asyncio.create_task(_live_coro)
                 except RuntimeError:
                     _live_coro.close()
-                self._safety_checker.record_order()
+                self._safety_checker.record_order(config.LIVE_STAKE_USDC)
 
     async def _simulate_realistic_fill(
         self,
@@ -521,12 +526,17 @@ class PaperTrader:
         except Exception as exc:
             logger.warning("Live order task failed: %s", exc)
             trade.live_fill_status = f"task_error:{exc}"
+            self._safety_checker.record_resolution(config.LIVE_STAKE_USDC)
             return
 
         trade.live_order_id = result.order_id
         trade.live_fill_status = result.fill_status
         trade.live_fill_price = result.avg_fill_price
         trade.live_filled_shares = result.filled_shares
+
+        if result.fill_status != "filled":
+            # Order didn't fill (FAK rejected) — money never at risk, release pending stake.
+            self._safety_checker.record_resolution(config.LIVE_STAKE_USDC)
 
         logger.info(
             "LIVE %s: status=%s, fill=%s, shares=%.2f, order_id=%s",
@@ -618,6 +628,8 @@ class PaperTrader:
                     trade.live_pnl_usdc = trade.live_filled_shares - cost - fee
                 else:
                     trade.live_pnl_usdc = -cost - fee
+                # Outcome is now in CSV on next flush — release pending stake.
+                self._safety_checker.record_resolution(config.LIVE_STAKE_USDC)
 
             self._buffer.append(trade)
 
