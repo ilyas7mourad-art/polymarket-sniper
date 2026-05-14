@@ -48,6 +48,25 @@ class SafetyChecker:
             self._recent_order_timestamps.popleft()
         return len(self._recent_order_timestamps) < config.LIVE_MAX_ORDERS_PER_HOUR
 
+    def check_daily_loss_at_startup(self) -> tuple[bool, float]:
+        """Read today's CSV PnL on bot startup and block trading if limit already hit.
+
+        Call this once at the top of run() before any order loops. Prevents a
+        restart from resetting the in-memory loss counter while the CSV already
+        shows losses beyond the daily cap.
+        """
+        within, todays_pnl = self.check_daily_loss_limit(stake_usdc=0.0)
+        if not within:
+            logger.error(
+                "Daily loss limit already hit at startup (CSV PnL=%.2f <= -%.2f). "
+                "Trading blocked for the rest of the day.",
+                todays_pnl,
+                config.LIVE_DAILY_LOSS_LIMIT_USDC,
+            )
+        else:
+            logger.info("Startup loss check: CSV PnL=%.2f (limit=-%.2f)", todays_pnl, config.LIVE_DAILY_LOSS_LIMIT_USDC)
+        return (within, todays_pnl)
+
     def check_daily_loss_limit(self, stake_usdc: float) -> tuple[bool, float]:
         """Compute today's live PnL from CSV. Returns (within_limit, todays_pnl).
 

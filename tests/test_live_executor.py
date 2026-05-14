@@ -166,7 +166,7 @@ def test_place_order_body_is_valid_json() -> None:
     assert "taker" not in order
     assert "nonce" not in order
     assert "feeRateBps" not in order
-    assert isinstance(order["timestamp"], int) and order["timestamp"] > 0
+    assert isinstance(order["timestamp"], str) and int(order["timestamp"]) > 0
     assert order["metadata"] == "0x" + "00" * 32
     assert order["builder"] == "0x" + "00" * 32
 

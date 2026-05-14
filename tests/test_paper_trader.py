@@ -43,13 +43,13 @@ def _make_market(end_offset_s: float = 60.0, condition_id: str = "0xabc") -> Mar
 
 def test_edge4_constants_are_correct() -> None:
     assert EDGE4_MID_THRESHOLD == 0.75
-    assert EDGE4_MAX_MID == 0.90
+    assert EDGE4_MAX_MID == 0.80
     assert EDGE4_TTL_MIN_S == 90.0
     assert EDGE4_TTL_MAX_S == 110.0
     assert "BTC" in EDGE4_ASSETS
     assert "ETH" not in EDGE4_ASSETS
     assert EDGE4_SKIP_UTC_HOURS == frozenset({2, 7, 9, 14, 18})
-    assert EDGE4_LABEL == "E4_TTL90-110s_0.75-0.90"
+    assert EDGE4_LABEL == "E4_TTL90-110s_0.75-0.80"
 
 
 def test_stake_usdc_is_one_dollar() -> None:
@@ -58,19 +58,19 @@ def test_stake_usdc_is_one_dollar() -> None:
 
 def test_evaluate_signals_fires_in_edge4_window() -> None:
     trader = PaperTrader()
-    # T-100s (center of 90-110s window), mid=0.85 (bid=0.84, ask=0.86)
+    # T-100s (center of 90-110s window), mid=0.77 (bid=0.76, ask=0.78) — within [0.75, 0.80)
     market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.86: 100.0}
-    trader._book_bids[market.up_token_id] = {0.84: 100.0}  # mid = 0.85
+    trader._book_asks[market.up_token_id] = {0.78: 100.0}
+    trader._book_bids[market.up_token_id] = {0.76: 100.0}  # mid = 0.77
 
     now = market.end_time - timedelta(seconds=100)
     trader._evaluate_signals(market.up_token_id, now)
 
     assert len(trader._open_trades) == 1
     trade = trader._open_trades[0]
-    assert trade.entry_price == 0.86
+    assert trade.entry_price == 0.78
     assert trade.signal_bucket_label == EDGE4_LABEL
 
 
@@ -79,8 +79,8 @@ def test_evaluate_signals_respects_deduplication() -> None:
     market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.86: 100.0}
-    trader._book_bids[market.up_token_id] = {0.84: 100.0}
+    trader._book_asks[market.up_token_id] = {0.78: 100.0}
+    trader._book_bids[market.up_token_id] = {0.76: 100.0}
 
     now = market.end_time - timedelta(seconds=100)
     trader._evaluate_signals(market.up_token_id, now)
@@ -187,18 +187,18 @@ def test_fire_entry_computes_fee_correctly() -> None:
     market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    # mid = 0.85: bid=0.84, ask=0.86
-    trader._book_asks[market.up_token_id] = {0.86: 100.0}
-    trader._book_bids[market.up_token_id] = {0.84: 100.0}
+    # mid = 0.77: bid=0.76, ask=0.78
+    trader._book_asks[market.up_token_id] = {0.78: 100.0}
+    trader._book_bids[market.up_token_id] = {0.76: 100.0}
 
     now = market.end_time - timedelta(seconds=100)
     trader._evaluate_signals(market.up_token_id, now)
 
     trade = trader._open_trades[0]
-    # stake=$1, shares = 1/0.86, fee = shares × 0.07 × 0.86 × 0.14
-    expected_fee = (1.0 / 0.86) * 0.07 * 0.86 * 0.14
+    # stake=$1, shares = 1/0.78, fee = shares × 0.07 × 0.78 × 0.22
+    expected_fee = (1.0 / 0.78) * 0.07 * 0.78 * 0.22
     assert abs(trade.fee_usdc - expected_fee) < 1e-4
-    assert abs(trade.simulated_shares - 1.0 / 0.86) < 1e-6
+    assert abs(trade.simulated_shares - 1.0 / 0.78) < 1e-6
 
 
 def test_resolve_open_trades_marks_win_correctly() -> None:
@@ -458,13 +458,13 @@ def test_sweep_unknowns_skips_already_resolved(tmp_path) -> None:
 
 
 def test_edge4_fires_at_ttl_boundary_low() -> None:
-    """At exactly T-90s (lower bound) with mid>=0.80 the signal fires."""
+    """At exactly T-90s (lower bound) with mid in [0.75, 0.80) the signal fires."""
     trader = PaperTrader()
     market = _make_market(end_offset_s=90.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.86: 100.0}
-    trader._book_bids[market.up_token_id] = {0.84: 100.0}  # mid=0.85
+    trader._book_asks[market.up_token_id] = {0.78: 100.0}
+    trader._book_bids[market.up_token_id] = {0.76: 100.0}  # mid=0.77
 
     now = market.end_time - timedelta(seconds=90)
     trader._evaluate_signals(market.up_token_id, now)
@@ -473,13 +473,13 @@ def test_edge4_fires_at_ttl_boundary_low() -> None:
 
 
 def test_edge4_fires_at_ttl_boundary_high() -> None:
-    """At exactly T-110s (upper bound) with mid>=0.80 the signal fires."""
+    """At exactly T-110s (upper bound) with mid in [0.75, 0.80) the signal fires."""
     trader = PaperTrader()
     market = _make_market(end_offset_s=110.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.86: 100.0}
-    trader._book_bids[market.up_token_id] = {0.84: 100.0}
+    trader._book_asks[market.up_token_id] = {0.78: 100.0}
+    trader._book_bids[market.up_token_id] = {0.76: 100.0}
 
     now = market.end_time - timedelta(seconds=110)
     trader._evaluate_signals(market.up_token_id, now)
@@ -503,13 +503,13 @@ def test_edge4_no_fire_just_outside_ttl_window() -> None:
 
 
 def test_edge4_fires_at_exact_mid_threshold() -> None:
-    """At mid exactly 0.80 (bid=0.78, ask=0.82) the signal fires."""
+    """At mid=0.79 (bid=0.78, ask=0.80) the signal fires — just inside the [0.75, 0.80) window."""
     trader = PaperTrader()
     market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    trader._book_asks[market.up_token_id] = {0.82: 100.0}
-    trader._book_bids[market.up_token_id] = {0.78: 100.0}  # mid=0.80
+    trader._book_asks[market.up_token_id] = {0.80: 100.0}
+    trader._book_bids[market.up_token_id] = {0.78: 100.0}  # mid=0.79
 
     now = market.end_time - timedelta(seconds=100)
     trader._evaluate_signals(market.up_token_id, now)
