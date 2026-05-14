@@ -67,7 +67,8 @@ _AUTH_TYPES = {
 
 _MSG_TO_SIGN = "This message attests that I control the given wallet"
 
-# signatureType value for Gnosis Safe proxy wallets (UI-created wallets)
+# signatureType: 1 = POLY_PROXY (Polymarket browser wallets)
+#                2 = POLY_GNOSIS_SAFE (Gnosis Safe — use for this wallet)
 _POLY_GNOSIS_SAFE = 2
 
 
@@ -216,8 +217,9 @@ class LiveExecutor:
         size_shares: float,
         side: str = "BUY",
         neg_risk: bool = False,
+        order_type: str = "FAK",
     ) -> LiveOrderResult:
-        """Place a FAK (Fill-and-Kill) order.
+        """Place an order.
 
         Args:
             token_id: Polymarket asset/token ID.
@@ -225,6 +227,7 @@ class LiveExecutor:
             size_shares: Number of shares to buy.
             side: "BUY" or "SELL".
             neg_risk: True for multi-outcome (neg-risk) markets.
+            order_type: "FAK", "GTC", "GTD", or "FOK".
 
         Returns:
             LiveOrderResult with fill details.
@@ -269,7 +272,6 @@ class LiveExecutor:
                 error_message=f"signing: {exc}",
             )
 
-        _zero_b32_hex = "0x" + "00" * 32
         body = {
             "deferExec": False,
             "order": {
@@ -282,12 +284,15 @@ class LiveExecutor:
                 "side": side,
                 "signatureType": _POLY_GNOSIS_SAFE,
                 "signature": "0x" + signature,
-                "timestamp": timestamp_ms,
-                "metadata": _zero_b32_hex,
-                "builder": _zero_b32_hex,
+                # V2 REST API: timestamp and expiration are strings; metadata is "".
+                # EIP-712 signs timestamp as uint256 (int) — these are serialisation-only changes.
+                "timestamp": str(timestamp_ms),
+                "expiration": "0",
+                "metadata": "0x" + "00" * 32,
+                "builder": "0x" + "00" * 32,
             },
             "owner": self._api_creds["api_key"],
-            "orderType": "FAK",
+            "orderType": order_type,
         }
         body_str = json.dumps(body, separators=(",", ":"))
         headers = self._l2_headers("POST", "/order", body_str)
@@ -372,13 +377,20 @@ class LiveExecutor:
         """Return USDC balance of the proxy wallet."""
         await self._ensure_api_creds()
         path = "/balance-allowance"
+        params = {
+            "asset_type": "COLLATERAL",
+            "signature_type": 2,  # wallet lookup type: 2 = Gnosis Safe proxy (wallet creation type, not order sig type)
+            "proxy_wallet": self._funder,
+        }
         headers = self._l2_headers("GET", path)
+        full_url = f"{config.CLOB_HOST}{path}?" + "&".join(f"{k}={v}" for k, v in params.items())
+        logger.debug("get_balance GET %s", full_url)
         try:
             resp = await asyncio.to_thread(
                 self._session.get,
                 f"{config.CLOB_HOST}{path}",
                 headers=headers,
-                params={"asset_type": "COLLATERAL"},
+                params=params,
             )
             data = resp.json()
         except Exception as exc:

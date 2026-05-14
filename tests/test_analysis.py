@@ -262,7 +262,7 @@ def test_compute_win_rates_by_bucket_empty_bucket_omitted_or_zero() -> None:
 def test_default_fee_rate_is_crypto_rate() -> None:
     assert DEFAULT_CATEGORY == "crypto"
     assert DEFAULT_FEE_RATE == CATEGORY_FEE_RATES["crypto"]
-    assert DEFAULT_FEE_RATE == 0.072
+    assert DEFAULT_FEE_RATE == 0.07
 
 
 # ---------------------------------------------------------------------------
@@ -332,8 +332,8 @@ def test_custom_fee_rate_applied() -> None:
 
 
 def test_compute_taker_fee_at_50_peaks() -> None:
-    # fee = 100 × 0.072 × 0.50 × 0.50 = 1.8
-    assert abs(compute_taker_fee(0.50, 100) - 1.8) < 1e-4
+    # fee = 100 × 0.07 × 0.50 × 0.50 = 1.75
+    assert abs(compute_taker_fee(0.50, 100) - 1.75) < 1e-4
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +342,8 @@ def test_compute_taker_fee_at_50_peaks() -> None:
 
 
 def test_compute_taker_fee_at_99_tiny() -> None:
-    # fee = 100 × 0.072 × 0.99 × 0.01 = 0.07128
-    assert abs(compute_taker_fee(0.99, 100) - 0.07128) < 1e-4
+    # fee = 100 × 0.07 × 0.99 × 0.01 = 0.0693
+    assert abs(compute_taker_fee(0.99, 100) - 0.0693) < 1e-4
 
 
 # ---------------------------------------------------------------------------
@@ -382,12 +382,12 @@ def test_compute_taker_fee_custom_category() -> None:
 
 
 def test_fee_adjusted_ev_uses_real_formula() -> None:
-    # 98% win rate at avg_ask=0.99, crypto rate 0.072
-    # fee_per_share = 0.072 × 0.99 × 0.01 = 0.0007128
-    # EV = 0.98 × (1 - 0.0007128) - 0.99
+    # 98% win rate at avg_ask=0.99, crypto rate 0.07
+    # fee_per_share = 0.07 × 0.99 × 0.01 = 0.0006930
+    # EV = 0.98 × (1 - 0.0006930) - 0.99
     snaps = [_make_snapshot("Up", 0.99, "Up")] * 98 + [_make_snapshot("Up", 0.99, "Down")] * 2
     stats = compute_win_rates_by_bucket(snaps, [(0.95, 1.00)])
-    expected = 0.98 * (1 - 0.072 * 0.99 * 0.01) - 0.99
+    expected = 0.98 * (1 - 0.07 * 0.99 * 0.01) - 0.99
     assert abs(stats[0].fee_adjusted_ev - expected) < 1e-5
 
 
@@ -397,10 +397,10 @@ def test_fee_adjusted_ev_uses_real_formula() -> None:
 
 
 def test_fee_adjusted_ev_mid_price_worst_case() -> None:
-    # 70% win rate at avg_ask=0.50, crypto rate 0.072
-    # fee_per_share = 0.072 × 0.50 × 0.50 = 0.018
-    # EV = 0.70 × (1 - 0.018) - 0.50
+    # 70% win rate at avg_ask=0.50, crypto rate 0.07
+    # fee_per_share = 0.07 × 0.50 × 0.50 = 0.0175
+    # EV = 0.70 × (1 - 0.0175) - 0.50
     snaps = [_make_snapshot("Up", 0.50, "Up")] * 7 + [_make_snapshot("Up", 0.50, "Down")] * 3
     stats = compute_win_rates_by_bucket(snaps, [(0.45, 0.55)])
-    expected = 0.70 * (1 - 0.072 * 0.50 * 0.50) - 0.50
+    expected = 0.70 * (1 - 0.07 * 0.50 * 0.50) - 0.50
     assert abs(stats[0].fee_adjusted_ev - expected) < 1e-5

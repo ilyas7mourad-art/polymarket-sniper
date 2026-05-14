@@ -40,12 +40,12 @@ SWEEP_MAX_AGE_SECONDS = 6 * 3600   # 6 hours — after this, give up permanently
 # Edge 4 signal params — final validated 2026-05-10.
 # Backtest (real fees): WR=92.7%, Sharpe=0.095, Max DD=-$5.68 at $1/trade over 20 days.
 EDGE4_MID_THRESHOLD = 0.75          # orderbook mid ≥ 75%
-EDGE4_MAX_MID = 0.90                # orderbook mid < 90%: entries ≥0.90 are EV-negative at live fills
+EDGE4_MAX_MID = 0.80                # orderbook mid < 80%: slippage analysis (2026-05-14) shows ≥0.80 is EV-negative at live fills (+0.05 median slippage pushes break-even WR above expected 88.8%)
 EDGE4_TTL_MIN_S = 90.0              # seconds to resolution window
 EDGE4_TTL_MAX_S = 110.0
 EDGE4_ASSETS = frozenset({"BTC"})   # BTC only; ETH edge is negative
 EDGE4_SKIP_UTC_HOURS = frozenset({2, 7, 9, 14, 18})  # extended skip set (improves Sharpe)
-EDGE4_LABEL = "E4_TTL90-110s_0.75-0.90"
+EDGE4_LABEL = "E4_TTL90-110s_0.75-0.80"
 
 _CSV_HEADER = [
     "trade_id",
@@ -184,6 +184,12 @@ class PaperTrader:
         loop = asyncio.get_event_loop()
         for sig in (os_signal.SIGINT, os_signal.SIGTERM):
             loop.add_signal_handler(sig, self._shutdown)
+
+        within, _ = self._safety_checker.check_daily_loss_at_startup()
+        if not within:
+            logger.error("Aborting: daily loss limit already reached. Touch kill switch to override.")
+            self._shutdown()
+            return
 
         await self._refresh_markets()
 
