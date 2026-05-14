@@ -24,6 +24,10 @@ class SafetyChecker:
     def __init__(self) -> None:
         self._kill_switch_path = Path(config.KILL_SWITCH_PATH)
         self._recent_order_timestamps: deque[datetime] = deque(maxlen=500)
+        # Worst-case open exposure from orders placed but not yet resolved in the CSV.
+        # Prevents concurrent signals from both slipping past the daily loss cap before
+        # either appears in the CSV (the breach mode that occurred on 2026-05-14).
+        self._pending_stake: float = 0.0
 
     def check_kill_switch(self) -> bool:
         """Return True if kill switch is active (file exists)."""
@@ -44,8 +48,13 @@ class SafetyChecker:
             self._recent_order_timestamps.popleft()
         return len(self._recent_order_timestamps) < config.LIVE_MAX_ORDERS_PER_HOUR
 
-    def check_daily_loss_limit(self) -> tuple[bool, float]:
-        """Compute today's live PnL from CSV. Returns (within_limit, todays_pnl)."""
+    def check_daily_loss_limit(self, stake_usdc: float) -> tuple[bool, float]:
+        """Compute today's live PnL from CSV. Returns (within_limit, todays_pnl).
+
+        Includes _pending_stake (orders placed but not yet resolved/in-CSV) plus
+        stake_usdc (this new order) in the worst-case check, so two concurrent
+        signals can't both slip past the cap before either appears in the CSV.
+        """
         today = datetime.now(UTC).strftime("%Y%m%d")
         csv_path = Path(config.DATA_DIR) / f"paper_trades_{today}.csv"
 
@@ -68,17 +77,27 @@ class SafetyChecker:
             logger.warning("Could not read today's CSV for loss limit check: %s", exc)
             return (True, 0.0)
 
-        within = todays_pnl > -config.LIVE_DAILY_LOSS_LIMIT_USDC
+        worst_case = todays_pnl - self._pending_stake - stake_usdc
+        within = worst_case > -config.LIVE_DAILY_LOSS_LIMIT_USDC
         return (within, todays_pnl)
 
-    def record_order(self) -> None:
-        """Call after a live order is placed (for rate limiting)."""
+    def record_order(self, stake_usdc: float) -> None:
+        """Call after a live order is dispatched (rate limiting + pending stake tracking)."""
         self._recent_order_timestamps.append(datetime.now(UTC))
+        self._pending_stake += stake_usdc
+
+    def record_resolution(self, stake_usdc: float) -> None:
+        """Call when a live order's outcome is known (filled+resolved, rejected, or error).
+
+        Releases the pending stake so future cap checks don't double-count it.
+        """
+        self._pending_stake = max(0.0, self._pending_stake - stake_usdc)
 
     def can_place_order(
         self,
         balance_usdc: float,
         open_positions: int,
+        stake_usdc: float = 0.0,
     ) -> tuple[bool, Optional[str]]:
         """Composite safety check.
 
@@ -103,7 +122,7 @@ class SafetyChecker:
         if not self.check_rate_limit():
             return (False, f"rate_limit ({len(self._recent_order_timestamps)} orders in last hour)")
 
-        within_limit, todays_pnl = self.check_daily_loss_limit()
+        within_limit, todays_pnl = self.check_daily_loss_limit(stake_usdc)
         if not within_limit:
             return (
                 False,
