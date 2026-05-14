@@ -12,6 +12,7 @@ from src.paper_trader import (
     PaperTrader,
     STAKE_USDC,
     EDGE4_LABEL,
+    EDGE4_MAX_MID,
     EDGE4_MID_THRESHOLD,
     EDGE4_TTL_MIN_S,
     EDGE4_TTL_MAX_S,
@@ -41,13 +42,14 @@ def _make_market(end_offset_s: float = 60.0, condition_id: str = "0xabc") -> Mar
 
 
 def test_edge4_constants_are_correct() -> None:
-    assert EDGE4_MID_THRESHOLD == 0.80
+    assert EDGE4_MID_THRESHOLD == 0.75
+    assert EDGE4_MAX_MID == 0.90
     assert EDGE4_TTL_MIN_S == 90.0
     assert EDGE4_TTL_MAX_S == 110.0
     assert "BTC" in EDGE4_ASSETS
     assert "ETH" not in EDGE4_ASSETS
     assert EDGE4_SKIP_UTC_HOURS == frozenset({2, 7, 9, 14, 18})
-    assert EDGE4_LABEL == "E4_TTL90-110s_0.80-1.00"
+    assert EDGE4_LABEL == "E4_TTL90-110s_0.75-0.90"
 
 
 def test_stake_usdc_is_one_dollar() -> None:
@@ -106,9 +108,24 @@ def test_evaluate_signals_no_fire_below_mid_threshold() -> None:
     market = _make_market(end_offset_s=100.0)
     trader._tracked[market.condition_id] = market
     trader._token_to_market[market.up_token_id] = (market, "Up")
-    # mid = 0.70 (bid=0.68, ask=0.72) — below 0.80 threshold
+    # mid = 0.70 (bid=0.68, ask=0.72) — below 0.75 min threshold
     trader._book_asks[market.up_token_id] = {0.72: 100.0}
     trader._book_bids[market.up_token_id] = {0.68: 100.0}
+
+    now = market.end_time - timedelta(seconds=100)
+    trader._evaluate_signals(market.up_token_id, now)
+
+    assert len(trader._open_trades) == 0
+
+
+def test_evaluate_signals_no_fire_at_or_above_max_mid() -> None:
+    trader = PaperTrader()
+    market = _make_market(end_offset_s=100.0)
+    trader._tracked[market.condition_id] = market
+    trader._token_to_market[market.up_token_id] = (market, "Up")
+    # mid = 0.92 (bid=0.90, ask=0.94) — at or above 0.90 max cap (EV-negative at live fills)
+    trader._book_asks[market.up_token_id] = {0.94: 100.0}
+    trader._book_bids[market.up_token_id] = {0.90: 100.0}
 
     now = market.end_time - timedelta(seconds=100)
     trader._evaluate_signals(market.up_token_id, now)

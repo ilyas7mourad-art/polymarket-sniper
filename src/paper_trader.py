@@ -40,12 +40,12 @@ SWEEP_MAX_AGE_SECONDS = 6 * 3600   # 6 hours — after this, give up permanently
 # Edge 4 signal params — final validated 2026-05-10.
 # Backtest (real fees): WR=92.7%, Sharpe=0.095, Max DD=-$5.68 at $1/trade over 20 days.
 EDGE4_MID_THRESHOLD = 0.75          # orderbook mid ≥ 75%
+EDGE4_MAX_MID = 0.90                # orderbook mid < 90%: entries ≥0.90 are EV-negative at live fills
 EDGE4_TTL_MIN_S = 90.0              # seconds to resolution window
 EDGE4_TTL_MAX_S = 110.0
 EDGE4_ASSETS = frozenset({"BTC"})   # BTC only; ETH edge is negative
 EDGE4_SKIP_UTC_HOURS = frozenset({2, 7, 9, 14, 18})  # extended skip set (improves Sharpe)
-# Label suffix 0.80-1.00 is used by _simulate_realistic_fill to parse the ask range.
-EDGE4_LABEL = "E4_TTL90-110s_0.75-1.00"
+EDGE4_LABEL = "E4_TTL90-110s_0.75-0.90"
 
 _CSV_HEADER = [
     "trade_id",
@@ -372,7 +372,7 @@ class PaperTrader:
             return
 
         if (EDGE4_TTL_MIN_S <= seconds_to_resolution <= EDGE4_TTL_MAX_S
-                and mid >= EDGE4_MID_THRESHOLD):
+                and EDGE4_MID_THRESHOLD <= mid < EDGE4_MAX_MID):
             target_s = (EDGE4_TTL_MIN_S + EDGE4_TTL_MAX_S) / 2.0
             self._fire_entry(market, side, best_ask, seconds_to_resolution,
                              target_s, EDGE4_LABEL, now)
