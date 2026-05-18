@@ -185,11 +185,48 @@ class PaperTrader:
         for sig in (os_signal.SIGINT, os_signal.SIGTERM):
             loop.add_signal_handler(sig, self._shutdown)
 
-        within, _ = self._safety_checker.check_daily_loss_at_startup()
-        if not within:
-            logger.error("Aborting: daily loss limit already reached. Touch kill switch to override.")
-            self._shutdown()
-            return
+        if config.LIVE_TRADING and self._live_executor is not None:
+            # Fetch current balance before starting any trading loops.
+            try:
+                balance = await self._live_executor.get_balance()
+            except Exception as exc:
+                logger.error("Cannot fetch wallet balance at startup: %s — aborting.", exc)
+                self._shutdown()
+                return
+            if balance == 0.0:
+                logger.error("Wallet balance is $0 at startup — aborting to avoid risk.")
+                self._shutdown()
+                return
+
+            # Load or create the start-of-day anchor balance.
+            today = datetime.now(UTC).strftime("%Y%m%d")
+            start_balance_path = Path(config.DATA_DIR) / f"start_balance_{today}.txt"
+            if start_balance_path.exists():
+                try:
+                    start_balance = float(start_balance_path.read_text().strip())
+                    logger.info("Loaded start-of-day balance: $%.4f", start_balance)
+                except (ValueError, OSError):
+                    start_balance = balance
+                    start_balance_path.write_text(f"{balance}\n")
+            else:
+                start_balance = balance
+                start_balance_path.write_text(f"{balance}\n")
+                logger.info("Saved start-of-day balance: $%.4f", start_balance)
+
+            self._cached_balance = balance
+            self._safety_checker.set_start_balance(start_balance)
+            logger.info("Current wallet balance: $%.4f USDC", balance)
+
+            within, drop = self._safety_checker.check_balance_loss(balance)
+            if not within:
+                logger.error(
+                    "Aborting: daily loss limit already reached at startup "
+                    "(balance dropped $%.2f >= $%.2f limit).",
+                    drop, config.LIVE_DAILY_LOSS_LIMIT_USDC,
+                )
+                self._shutdown()
+                return
+            logger.info("Startup loss check: balance drop=$%.2f (limit=$%.2f)", drop, config.LIVE_DAILY_LOSS_LIMIT_USDC)
 
         await self._refresh_markets()
 
@@ -462,7 +499,7 @@ class PaperTrader:
                     asyncio.create_task(_live_coro)
                 except RuntimeError:
                     _live_coro.close()
-                self._safety_checker.record_order(config.LIVE_STAKE_USDC)
+                self._safety_checker.record_order()
 
     async def _simulate_realistic_fill(
         self,
@@ -532,17 +569,12 @@ class PaperTrader:
         except Exception as exc:
             logger.warning("Live order task failed: %s", exc)
             trade.live_fill_status = f"task_error:{exc}"
-            self._safety_checker.record_resolution(config.LIVE_STAKE_USDC)
             return
 
         trade.live_order_id = result.order_id
         trade.live_fill_status = result.fill_status
         trade.live_fill_price = result.avg_fill_price
         trade.live_filled_shares = result.filled_shares
-
-        if result.fill_status != "filled":
-            # Order didn't fill (FAK rejected) — money never at risk, release pending stake.
-            self._safety_checker.record_resolution(config.LIVE_STAKE_USDC)
 
         logger.info(
             "LIVE %s: status=%s, fill=%s, shares=%.2f, order_id=%s",
@@ -557,13 +589,6 @@ class PaperTrader:
         """Periodically refresh the cached wallet balance (no-op in paper mode)."""
         if not config.LIVE_TRADING or self._live_executor is None:
             return
-
-        try:
-            self._cached_balance = await self._live_executor.get_balance()
-            self._balance_last_check = datetime.now(UTC)
-            logger.info("Initial wallet balance: $%.4f USDC", self._cached_balance)
-        except Exception as exc:
-            logger.warning("Initial balance fetch failed: %s", exc)
 
         while self._running:
             await asyncio.sleep(60)
@@ -634,8 +659,6 @@ class PaperTrader:
                     trade.live_pnl_usdc = trade.live_filled_shares - cost - fee
                 else:
                     trade.live_pnl_usdc = -cost - fee
-                # Outcome is now in CSV on next flush — release pending stake.
-                self._safety_checker.record_resolution(config.LIVE_STAKE_USDC)
 
             self._buffer.append(trade)
 

@@ -48,6 +48,25 @@ class BinancePriceFeed:
         }
         self._running = False
 
+    def get_move_pct(
+        self,
+        asset: str,
+        lookback_seconds: float = SIGNAL_LOOKBACK_SECONDS,
+    ) -> float:
+        """Return price change as a fraction over the lookback window (positive = up).
+
+        Returns 0.0 if fewer than two data points exist in the window.
+        """
+        history = self._history.get(asset)
+        if not history:
+            return 0.0
+        now    = datetime.now(UTC)
+        cutoff = now.timestamp() - lookback_seconds
+        window = [price for ts, price in history if ts.timestamp() >= cutoff]
+        if len(window) < 2:
+            return 0.0
+        return (window[-1] - window[0]) / window[0]
+
     def get_direction(
         self,
         asset: str,
