@@ -30,6 +30,7 @@ def _make_market(
         condition_id=condition_id,
         question=f"{asset} Up or Down - test",
         asset=asset,
+        timeframe="5m",
         start_time=now,
         end_time=now + timedelta(seconds=end_offset_s),
         up_token_id=f"up_{condition_id}",

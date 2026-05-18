@@ -221,6 +221,40 @@ def test_get_balance_failure() -> None:
     assert balance == 0.0
 
 
+def test_get_balance_http_error_returns_zero() -> None:
+    """Non-200 HTTP response → returns 0.0, no crash."""
+    executor = _make_executor()
+    error_resp = _mock_get_response({"error": "Unauthorized"}, status=401)
+    error_resp.text = '{"error": "Unauthorized"}'
+    with patch.object(executor._session, "get", return_value=error_resp):
+        balance = asyncio.run(executor.get_balance())
+
+    assert balance == 0.0
+
+
+def test_get_balance_hmac_includes_query_string() -> None:
+    """_l2_headers is called with query params in the path (required by Polymarket CLOB V2)."""
+    executor = _make_executor()
+    api_resp = {"balance": "5000000"}
+    captured_path: list[str] = []
+
+    original_l2 = executor._l2_headers
+
+    def spy_l2_headers(method: str, path: str, body: str = "") -> dict:
+        captured_path.append(path)
+        return original_l2(method, path, body)
+
+    with patch.object(executor, "_l2_headers", side_effect=spy_l2_headers):
+        with patch.object(executor._session, "get", return_value=_mock_get_response(api_resp)):
+            asyncio.run(executor.get_balance())
+
+    assert len(captured_path) == 1
+    signed = captured_path[0]
+    assert "?" in signed, "HMAC path must include query string"
+    assert "asset_type=COLLATERAL" in signed
+    assert "proxy_wallet=" in signed
+
+
 def test_get_balance_initializes_creds() -> None:
     """get_balance triggers _ensure_api_creds when creds are missing."""
     with patch("src.live_executor.config") as mock_cfg:

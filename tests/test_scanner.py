@@ -4,11 +4,13 @@ from datetime import datetime, timedelta, timezone
 
 from src.scanner import (
     Market,
-    SERIES_IDS,
+    SERIES_CONFIG,
     _parse_iso_utc,
     _try_parse_event_market,
     parse_event_market,
 )
+
+_5M = timedelta(minutes=5)
 
 UTC = timezone.utc
 
@@ -69,14 +71,16 @@ def test_parse_iso_utc_handles_offset_suffix() -> None:
 
 
 # ---------------------------------------------------------------------------
-# SERIES_IDS
+# SERIES_CONFIG
 # ---------------------------------------------------------------------------
 
 
-def test_series_ids_contains_btc_and_eth() -> None:
-    assert "BTC" in SERIES_IDS and "ETH" in SERIES_IDS
-    assert isinstance(SERIES_IDS["BTC"], int)
-    assert isinstance(SERIES_IDS["ETH"], int)
+def test_series_config_contains_btc_and_eth() -> None:
+    assets = {cfg["asset"] for cfg in SERIES_CONFIG}
+    assert "BTC" in assets and "ETH" in assets
+    for cfg in SERIES_CONFIG:
+        assert isinstance(cfg["series_id"], int)
+        assert isinstance(cfg["window"], timedelta)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +90,7 @@ def test_series_ids_contains_btc_and_eth() -> None:
 
 def test_parse_event_market_happy_path_btc() -> None:
     event = _make_event()
-    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
 
     assert reason is None
     assert market is not None
@@ -105,7 +109,7 @@ def test_parse_event_market_happy_path_eth() -> None:
     event = _make_event(
         question="Ethereum Up or Down - April 17, 7:05PM-7:10PM ET",
     )
-    market, reason = _try_parse_event_market(event, "ETH", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "ETH", "5m", _5M, reference_date=REF)
 
     assert reason is None
     assert market is not None
@@ -116,7 +120,7 @@ def test_parse_event_market_happy_path_eth() -> None:
 
 def test_parse_event_market_rejects_no_markets() -> None:
     event = _make_event(include_market=False)
-    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
     assert market is None
     assert reason == "no_markets"
 
@@ -124,7 +128,7 @@ def test_parse_event_market_rejects_no_markets() -> None:
 def test_parse_event_market_rejects_missing_dates() -> None:
     event = _make_event(event_start="", end_date="")
     # Both fields are empty strings — parser should return missing_dates
-    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
     assert market is None
     assert reason == "missing_dates"
 
@@ -132,7 +136,7 @@ def test_parse_event_market_rejects_missing_dates() -> None:
 def test_parse_event_market_rejects_wrong_window() -> None:
     # 10-minute span instead of 5
     event = _make_event(end_date="2026-04-17T23:15:00Z")
-    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
     assert market is None
     assert reason == "wrong_window_size"
 
@@ -143,7 +147,7 @@ def test_parse_event_market_rejects_stale() -> None:
         event_start="2026-04-17T21:00:00Z",
         end_date="2026-04-17T21:05:00Z",
     )
-    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
     assert market is None
     assert reason == "stale"
 
@@ -154,14 +158,14 @@ def test_parse_event_market_rejects_too_far_future() -> None:
         event_start="2026-04-20T23:05:00Z",
         end_date="2026-04-20T23:10:00Z",
     )
-    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
     assert market is None
     assert reason == "too_far_future"
 
 
 def test_parse_event_market_rejects_missing_tokens() -> None:
     event = _make_event(clob_token_ids="")
-    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
     assert market is None
     assert reason == "missing_tokens"
 
@@ -169,7 +173,7 @@ def test_parse_event_market_rejects_missing_tokens() -> None:
 def test_parse_event_market_yes_no_outcomes() -> None:
     """Markets that use Yes/No instead of Up/Down should still map correctly."""
     event = _make_event(outcomes='["Yes", "No"]')
-    market, reason = _try_parse_event_market(event, "BTC", reference_date=REF)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
     assert reason is None
     assert market is not None
     assert market.up_token_id == "111"
@@ -179,7 +183,7 @@ def test_parse_event_market_yes_no_outcomes() -> None:
 def test_parse_event_market_public_wrapper() -> None:
     """parse_event_market returns a Market (not a tuple)."""
     event = _make_event()
-    result = parse_event_market(event, "BTC", reference_date=REF)
+    result = parse_event_market(event, "BTC", "5m", _5M, reference_date=REF)
     assert isinstance(result, Market)
     assert result.asset == "BTC"
 
@@ -191,6 +195,6 @@ def test_parse_event_market_rejects_december_2025_zombie() -> None:
         event_start="2025-12-19T16:35:00Z",
         end_date="2025-12-19T16:40:00Z",
     )
-    market, reason = _try_parse_event_market(event, "BTC", ref)
+    market, reason = _try_parse_event_market(event, "BTC", "5m", _5M, ref)
     assert market is None
     assert reason == "stale"

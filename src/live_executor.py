@@ -382,9 +382,12 @@ class LiveExecutor:
             "signature_type": 2,  # wallet lookup type: 2 = Gnosis Safe proxy (wallet creation type, not order sig type)
             "proxy_wallet": self._funder,
         }
-        headers = self._l2_headers("GET", path)
-        full_url = f"{config.CLOB_HOST}{path}?" + "&".join(f"{k}={v}" for k, v in params.items())
-        logger.debug("get_balance GET %s", full_url)
+        # Polymarket CLOB V2 HMAC must cover the full path including query string.
+        # Signing only the base path produces an invalid signature for GET requests.
+        query_string = "&".join(f"{k}={v}" for k, v in params.items())
+        signed_path = f"{path}?{query_string}"
+        headers = self._l2_headers("GET", signed_path)
+        logger.debug("get_balance GET %s%s", config.CLOB_HOST, signed_path)
         try:
             resp = await asyncio.to_thread(
                 self._session.get,
@@ -392,6 +395,11 @@ class LiveExecutor:
                 headers=headers,
                 params=params,
             )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Balance fetch HTTP %s: %s", resp.status_code, resp.text[:200]
+                )
+                return 0.0
             data = resp.json()
         except Exception as exc:
             logger.warning("Balance fetch failed: %s", exc)
